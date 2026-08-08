@@ -1,0 +1,59 @@
+[project]
+name = "eraft-solution"
+version = "0.1.0"
+description = "DINOv2 + INP-Former 无监督异常检测 (Real-IAD Variety)"
+requires-python = ">=3.10"
+dependencies = [
+    # ── torch 按平台自动选择 ──────────────────────────────
+    # macOS  → 从 PyPI 拉 CPU/MPS 版 torch（限制 2.5.x 兼容 macOS 13）
+    # Linux  → 从 pytorch-cu124 索引拉 CUDA 版 torch
+    "torch>=2.1.0,<2.6 ; sys_platform == 'darwin'",
+    "torch>=2.1.0 ; sys_platform != 'darwin'",
+    "torchvision>=0.16.0,<0.21 ; sys_platform == 'darwin'",
+    "torchvision>=0.16.0 ; sys_platform != 'darwin'",
+    # ── 通用依赖 ──────────────────────────────────────────
+    "Pillow>=9.0.0",
+    "numpy>=1.24.0",
+    "tqdm>=4.60.0",
+    "timm>=0.9.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ipython",
+    "matplotlib",
+    "tensorboard",
+]
+
+# ── 安装方式 ──────────────────────────────────────────────────────────
+#
+# CPU / macOS（本地验证）:
+#   uv sync
+#
+# GPU / Linux（RTX 30/40 系列，CUDA 12.4）:
+#   uv sync --index pytorch-cu124
+#
+# GPU / Linux（RTX 50 系列 Blackwell，CUDA 12.8）:
+#   uv sync --index pytorch-cu128
+#
+# ──────────────────────────────────────────────────────────────────────
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+# Linux 默认走 cu128（支持 RTX 50 系列 Blackwell sm_120）
+# macOS 条目无 index → 走 PyPI
+torch = [
+    { index = "pytorch-cu128", marker = "sys_platform != 'darwin'" },
+]
+torchvision = [
+    { index = "pytorch-cu128", marker = "sys_platform != 'darwin'" },
+]

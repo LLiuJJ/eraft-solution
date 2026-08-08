@@ -1,0 +1,30 @@
+# 数据目录（训练集/测试集，文件太大）
+data/
+
+# 模型权重（DINOv2 预训练权重，约 330MB）
+weights/
+
+# 训练生成的 checkpoint
+checkpoints/
+
+# 提交文件输出
+submission/
+*.zip
+
+# Python 环境
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE 和系统文件
+.DS_Store
+.idea/
+.vscode/
+
+# uv 锁文件（跨平台不一致）
+uv.lock
+
+# 日志和临时文件
+*.log
+results.json

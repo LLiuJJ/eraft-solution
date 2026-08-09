@@ -4,15 +4,7 @@
 
 ## 技术架构
 
-```
-输入图像 [B, V=5, C, H, W]
-    ↓
-DINOv2 ViT-B/14 (冻结) → 多尺度 patch 特征 [B, V, N, 768]
-    ↓
-ViewPatchEncoder (Transformer) → 编码特征 [B, 1+V*N, 256]
-    ↓
-Normalizing Flow → 学习正常分布 → NLL 异常得分
-```
+![INP-Former 模型架构](img/architecture.png)
 
 **核心思路**：
 1. **DINOv2**（冻结）提取每个视角的 patch-level 语义特征

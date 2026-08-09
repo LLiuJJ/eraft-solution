@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>INP-Former 模型架构</title>
+<script>
+  window.MathJax = {
+    tex: { inlineMath: [['$', '$'], ['\\(', '\\)']], displayMath: [['$$', '$$'], ['\\[', '\\]']] },
+    svg: { fontCache: 'global' }
+  };
+</script>
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>
+<style>
+  :root {
+    --bg: #0d1117;
+    --card-bg: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --text-dim: #8b949e;
+    --accent: #58a6ff;
+    --accent2: #f0883e;
+    --accent3: #3fb950;
+    --accent4: #f778ba;
+    --code-bg: #1c2128;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.6;
+    padding: 40px 20px;
+  }
+  .container { max-width: 1200px; margin: 0 auto; }
+  h1 {
+    text-align: center;
+    font-size: 2.4em;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    margin-bottom: 8px;
+  }
+  .subtitle {
+    text-align: center;
+    color: var(--text-dim);
+    font-size: 1.1em;
+    margin-bottom: 50px;
+  }
+  /* ── Flow Diagram ── */
+  .flow-section {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 30px;
+    margin-bottom: 40px;
+  }
+  .flow-section h2 {
+    font-size: 1.5em;
+    margin-bottom: 20px;
+    color: var(--accent);
+  }
+  .pipeline {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0;
+  }
+  .pipe-block {
+    width: 100%;
+    max-width: 700px;
+    border: 2px solid var(--border);
+    border-radius: 10px;
+    padding: 16px 24px;
+    text-align: center;
+    position: relative;
+    transition: transform 0.2s;
+  }
+  .pipe-block:hover { transform: scale(1.02); }
+  .pipe-block .title { font-weight: 700; font-size: 1.05em; }
+  .pipe-block .shape { color: var(--text-dim); font-size: 0.85em; font-family: monospace; margin-top: 4px; }
+  .pipe-arrow {
+    width: 2px;
+    height: 32px;
+    background: var(--border);
+    position: relative;
+  }
+  .pipe-arrow::after {
+    content: '';
+    position: absolute;
+    bottom: -6px;
+    left: -5px;
+    width: 0; height: 0;
+    border-left: 6px solid transparent;
+    border-right: 6px solid transparent;
+    border-top: 8px solid var(--border);
+  }
+  /* color themes for blocks */
+  .b-input { border-color: var(--accent3); }
+  .b-dino { border-color: var(--accent); background: rgba(88,166,255,0.05); }
+  .b-fusion { border-color: var(--accent2); background: rgba(240,136,62,0.05); }
+  .b-transformer { border-color: var(--accent4); background: rgba(247,120,186,0.05); }
+  .b-flow { border-color: var(--accent3); background: rgba(63,185,80,0.05); }
+  .b-loss { border-color: var(--accent2); }
+  .b-score { border-color: var(--accent4); }
+  /* parallel blocks */
+  .pipe-parallel {
+    display: flex;
+    gap: 20px;
+    width: 100%;
+    max-width: 700px;
+    justify-content: center;
+  }
+  .pipe-parallel .pipe-block { max-width: 330px; }
+  /* ── Module Cards ── */
+  .modules { display: grid; gap: 30px; }
+  .module-card {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+  }
+  .module-header {
+    padding: 20px 24px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .module-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px; height: 32px;
+    border-radius: 8px;
+    font-weight: 700;
+    font-size: 0.85em;
+    flex-shrink: 0;
+  }
+  .badge-1 { background: rgba(63,185,80,0.15); color: var(--accent3); border: 1px solid var(--accent3); }
+  .badge-2 { background: rgba(88,166,255,0.15); color: var(--accent); border: 1px solid var(--accent); }
+  .badge-3 { background: rgba(240,136,62,0.15); color: var(--accent2); border: 1px solid var(--accent2); }
+  .badge-4 { background: rgba(247,120,186,0.15); color: var(--accent4); border: 1px solid var(--accent4); }
+  .badge-5 { background: rgba(63,185,80,0.15); color: var(--accent3); border: 1px solid var(--accent3); }
+  .badge-6 { background: rgba(240,136,62,0.15); color: var(--accent2); border: 1px solid var(--accent2); }
+  .badge-7 { background: rgba(247,120,186,0.15); color: var(--accent4); border: 1px solid var(--accent4); }
+  .module-title { font-size: 1.3em; font-weight: 700; }
+  .module-body { padding: 24px; }
+  .module-body p { color: var(--text-dim); margin-bottom: 12px; }
+  .formula-box {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px 20px;
+    margin: 12px 0;
+    overflow-x: auto;
+  }
+  .formula-label {
+    font-size: 0.8em;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 8px;
+  }
+  .config-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 12px;
+    font-size: 0.9em;
+  }
+  .config-table td {
+    padding: 6px 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  .config-table td:first-child { color: var(--text-dim); width: 40%; }
+  .config-table td:last-child { font-family: monospace; color: var(--accent); }
+  .tag {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 20px;
+    font-size: 0.75em;
+    font-weight: 600;
+    margin-left: 8px;
+  }
+  .tag-frozen { background: rgba(139,148,158,0.15); color: var(--text-dim); border: 1px solid var(--border); }
+  .tag-train { background: rgba(63,185,80,0.15); color: var(--accent3); border: 1px solid var(--accent3); }
+  .param-info {
+    margin-top: 16px;
+    padding: 12px 16px;
+    background: rgba(88,166,255,0.05);
+    border: 1px solid rgba(88,166,255,0.2);
+    border-radius: 8px;
+    font-size: 0.9em;
+  }
+  .param-info strong { color: var(--accent); }
+  /* ── Flow internals ── */
+  .flow-internals {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    justify-content: center;
+    margin: 16px 0;
+    flex-wrap: wrap;
+  }
+  .flow-step {
+    border: 1px solid var(--accent3);
+    border-radius: 8px;
+    padding: 8px 16px;
+    font-size: 0.85em;
+    background: rgba(63,185,80,0.05);
+    text-align: center;
+  }
+  .flow-repeat {
+    color: var(--text-dim);
+    font-size: 0.8em;
+    margin-top: 8px;
+    text-align: center;
+  }
+  /* ── Summary ── */
+  .summary {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px 30px;
+    margin-top: 40px;
+  }
+  .summary h2 { color: var(--accent2); margin-bottom: 16px; }
+  .summary ul { list-style: none; padding: 0; }
+  .summary li {
+    padding: 8px 0;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    gap: 12px;
+  }
+  .summary li:last-child { border: none; }
+  .summary li .num {
+    color: var(--accent2);
+    font-weight: 700;
+    flex-shrink: 0;
+  }
+  @media (max-width: 768px) {
+    body { padding: 20px 10px; }
+    h1 { font-size: 1.6em; }
+    .pipe-parallel { flex-direction: column; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>DINOv2 + INP-Former 模型架构</h1>
+<p class="subtitle">多视角无监督异常检测 · Real-IAD Variety · 7.08M 参数</p>
+
+<!-- ═══════════════ Pipeline Diagram ═══════════════ -->
+<div class="flow-section">
+  <h2>整体流程</h2>
+  <div class="pipeline">
+
+    <div class="pipe-block b-input">
+      <div class="title">输入：多视角图像</div>
+      <div class="shape">[B, V=5, 3, 518, 518]</div>
+    </div>
+    <div class="pipe-arrow"></div>
+
+    <div class="pipe-block b-dino">
+      <div class="title">DINOv2 ViT-B/14 <span class="tag tag-frozen">冻结</span></div>
+      <div class="shape">→ patch_features [B, 5, 1369, 768]<br>→ multi_scale_features (layer 9 + layer 11)</div>
+    </div>
+    <div class="pipe-arrow"></div>
+
+    <div class="pipe-block b-fusion">
+      <div class="title">多尺度特征融合</div>
+      <div class="shape">concat(layer_9, layer_11) → [B, 5, 1369, 1536]</div>
+    </div>
+    <div class="pipe-arrow"></div>
+
+    <div class="pipe-block b-transformer">
+      <div class="title">ViewPatchEncoder (Transformer ×4) <span class="tag tag-train">可训练</span></div>
+      <div class="shape">proj + pos_embed + view_embed → CLS + tokens → Transformer<br>→ cls_out [B, 256], view_tokens [B, 5, 256], encoded [B, 1+5×1369, 256]</div>
+    </div>
+    <div class="pipe-arrow"></div>
+
+    <div class="pipe-block" style="border-color: var(--text-dim); background: rgba(139,148,158,0.05);">
+      <div class="title">LayerNorm（稳定 Flow 输入）</div>
+      <div class="shape">cls_norm · view_norm</div>
+    </div>
+    <div class="pipe-arrow"></div>
+
+    <div class="pipe-parallel">
+      <div class="pipe-block b-flow">
+        <div class="title">Flow_cls</div>
+        <div class="shape">Normalizing Flow ×8 层<br>ActNorm → RotConv → Coupling<br>z_cls [B, 256]</div>
+      </div>
+      <div class="pipe-block b-flow">
+        <div class="title">Flow_view</div>
+        <div class="shape">Normalizing Flow ×8 层<br>ActNorm → RotConv → Coupling<br>z_view [B, 5, 256]</div>
+      </div>
+    </div>
+    <div class="pipe-arrow"></div>
+
+    <div class="pipe-parallel">
+      <div class="pipe-block b-loss">
+        <div class="title">训练：z 空间距离 Loss</div>
+        <div class="shape">ℒ = ½‖z_cls‖² + 0.5·½‖z_view‖²<br>+ 0.1·Var正则</div>
+      </div>
+      <div class="pipe-block b-score">
+        <div class="title">推理：异常评分</div>
+        <div class="shape">image_score = ‖z_cls‖ + mean(‖z_view‖)<br>patch_score = kNN + Flow融合</div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- ═══════════════ Module Cards ═══════════════ -->
+<div class="modules">
+
+<!-- 1. DINOv2 -->
+<div class="module-card">
+  <div class="module-header">
+    <span class="module-badge badge-1">1</span>
+    <span class="module-title">DINOv2 ViT-B/14 特征提取器 <span class="tag tag-frozen">冻结</span></span>
+  </div>
+  <div class="module-body">
+    <p>自监督预训练的视觉 Transformer，在 ImageNet 上学习到丰富的语义表示。模型权重完全冻结，仅作为特征提取器。</p>
+    <div class="formula-box">
+      <div class="formula-label">Patch 嵌入</div>
+      $$ \mathbf{F}_{\text{patch}} = \text{ViT-B/14}(\mathbf{X}) \quad \mathbf{F}_{\text{patch}} \in \mathbb{R}^{V \times N \times 768} $$
+      <div class="formula-label" style="margin-top:10px;">多尺度输出</div>
+      $$ \mathbf{F}_{\text{ms}} = [\, \text{layer}_9(\mathbf{X}),\; \text{layer}_{11}(\mathbf{X}) \,] \in \mathbb{R}^{V \times N \times 1536} $$
+    </div>
+    <table class="config-table">
+      <tr><td>模型</td><td>dinov2_vitb14</td></tr>
+      <tr><td>Patch 大小</td><td>14 × 14</td></tr>
+      <tr><td>输入尺寸</td><td>518 × 518 (37 × 37 = 1369 patches)</td></tr>
+      <tr><td>嵌入维度</td><td>768</td></tr>
+      <tr><td>输出层</td><td>[3, 6, 9, 11]</td></tr>
+    </table>
+  </div>
+</div>
+
+<!-- 2. Multi-scale Fusion -->
+<div class="module-card">
+  <div class="module-header">
+    <span class="module-badge badge-2">2</span>
+    <span class="module-title">多尺度特征融合</span>
+  </div>
+  <div class="module-body">
+    <p>拼接 DINOv2 倒数第二层（layer 9，浅层纹理特征）和最后一层（layer 11，深层语义特征），兼顾局部纹理异常与全局语义异常的检测能力。</p>
+    <div class="formula-box">
+      <div class="formula-label">特征拼接</div>
+      $$ \mathbf{F}_{\text{fused}} = \text{concat}\big(\mathbf{F}^{(9)},\; \mathbf{F}^{(11)}\big) \in \mathbb{R}^{B \times V \times N \times 1536} $$
+      <div class="formula-label" style="margin-top:10px;">投影降维</div>
+      $$ \mathbf{F}_{\text{proj}} = \text{GELU}\big(\text{LN}(\mathbf{W}\cdot\mathbf{F}_{\text{fused}} + \mathbf{b})\big) \in \mathbb{R}^{B \times V \times N \times 256} $$
+    </div>
+  </div>
+</div>
+
+<!-- 3. ViewPatchEncoder -->
+<div class="module-card">
+  <div class="module-header">
+    <span class="module-badge badge-3">3</span>
+    <span class="module-title">ViewPatchEncoder（多视角 Transformer） <span class="tag tag-train">可训练</span></span>
+  </div>
+  <div class="module-body">
+    <p>将 5 个视角的所有 patch 展平为一个长序列，用 Transformer 同时建模视角内空间关系和视角间对应关系。通过视角嵌入和位置编码区分不同视角的不同 patch。</p>
+    <div class="formula-box">
+      <div class="formula-label">输入增强：位置编码 + 视角嵌入</div>
+      $$ \mathbf{H}^{(0)} = \mathbf{F}_{\text{proj}} + \mathbf{E}_{\text{pos}} + \mathbf{E}_{\text{view}} $$
+      <div class="formula-label" style="margin-top:10px;">前置 CLS token</div>
+      $$ \mathbf{S}^{(0)} = \text{concat}\big([\text{CLS}],\; \text{flatten}(\mathbf{H}^{(0)})\big) \in \mathbb{R}^{B \times (1+VN) \times 256} $$
+      <div class="formula-label" style="margin-top:10px;">Pre-LN Transformer（4 层）</div>
+      $$ \mathbf{S}^{(l+1)} = \mathbf{S}^{(l)} + \text{FFN}\big(\text{LN}(\mathbf{S}^{(l)} + \text{MHA}(\text{LN}(\mathbf{S}^{(l)})))\big) $$
+      <div class="formula-label" style="margin-top:10px;">多头自注意力</div>
+      $$ \text{MHA}(\mathbf{S}) = \text{concat}(\text{head}_1, \dots, \text{head}_8)\mathbf{W}_O, \quad \text{head}_i = \text{softmax}\!\Big(\frac{\mathbf{Q}_i\mathbf{K}_i^\top}{\sqrt{d_k}}\Big)\mathbf{V}_i $$
+    </div>
+    <table class="config-table">
+      <tr><td>d_model</td><td>256</td></tr>
+      <tr><td>注意力头数</td><td>8 (d_k = 32)</td></tr>
+      <tr><td>层数</td><td>4</td></tr>
+      <tr><td>FFN 维度</td><td>1024</td></tr>
+      <tr><td>序列长度</td><td>1 + 5 × 1369 = 6846</td></tr>
+      <tr><td>激活函数</td><td>GELU</td></tr>
+    </table>
+    <div class="param-info">
+      <strong>输出：</strong>cls_out [B, 256]（全局汇总）、view_tokens [B, 5, 256]（每视角均值池化）、encoded [B, 1+VN, 256]（全量 patch 编码，用于异常定位）
+    </div>
+  </div>
+</div>
+
+<!-- 4. Normalizing Flow -->
+<div class="module-card">
+  <div class="module-header">
+    <span class="module-badge badge-4">4</span>
+    <span class="module-title">Normalizing Flow（可逆生成流） <span class="tag tag-train">可训练</span></span>
+  </div>
+  <div class="module-body">
+    <p>将 Transformer 编码的正常特征映射到标准高斯分布。推理时，异常样本偏离高斯原点 → z 空间距离大 → 异常得分高。由 8 层可逆变换组成，每层包含三个子模块：</p>
+    <div class="flow-internals">
+      <div class="flow-step">ActNorm</div>
+      <span style="color:var(--text-dim)">→</span>
+      <div class="flow-step">Invertible1x1Conv<br>(旋转矩阵)</div>
+      <span style="color:var(--text-dim)">→</span>
+      <div class="flow-step">AffineCoupling</div>
+    </div>
+    <div class="flow-repeat">↑ 重复 8 次 ×（Flow_cls 和 Flow_view 各一套）</div>
+
+    <div class="formula-box">
+      <div class="formula-label">① ActNorm：可逆仿射归一化</div>
+      $$ \mathbf{y} = (\mathbf{x} - \boldsymbol{\mu}) \cdot e^{-\mathbf{s}}, \quad \log|\det \tfrac{\partial \mathbf{y}}{\partial \mathbf{x}}| = -\sum_i s_i $$
+      <p style="font-size:0.85em; color:var(--text-dim); margin-top:4px;">首 batch 用数据均值/标准差初始化，之后可学习。log_scale 被 clamp 到 [-3, 3] 保证数值稳定。</p>
+
+      <div class="formula-label" style="margin-top:16px;">② Invertible1x1Conv：旋转矩阵参数化</div>
+      $$ \begin{pmatrix} y_{2i} \\ y_{2i+1} \end{pmatrix} = \begin{pmatrix} \cos\theta_i & -\sin\theta_i \\ \sin\theta_i & \cos\theta_i \end{pmatrix} \begin{pmatrix} x_{2i} \\ x_{2i+1} \end{pmatrix}, \quad \log|\det R| = 0 $$
+      <p style="font-size:0.85em; color:var(--text-dim); margin-top:4px;">用 D/2 个可学习角度替代正交矩阵，避免 slogdet 的 CUDA hang。旋转矩阵行列式恒为 1，log_det = 0。</p>
+
+      <div class="formula-label" style="margin-top:16px;">③ AffineCoupling：仿射耦合层</div>
+      $$ \mathbf{x} = [\mathbf{x}_1,\; \mathbf{x}_2], \quad \mathbf{y}_2 = \mathbf{x}_2 \odot e^{\,s(\mathbf{x}_1)} + t(\mathbf{x}_1), \quad \mathbf{y} = [\mathbf{x}_1,\; \mathbf{y}_2] $$
+      $$ \text{where } s, t = \text{MLP}_{256}(\mathbf{x}_1), \quad s = \tanh(s), \quad \log|\det| = \sum_i s_i $$
+      <p style="font-size:0.85em; color:var(--text-dim); margin-top:4px;">将输入分两半，用前半预测后半的缩放和平移。最后一层零初始化使初始变换接近恒等。</p>
+
+      <div class="formula-label" style="margin-top:16px;">Flow 整体变换</div>
+      $$ \mathbf{z} = f_{\text{flow}}(\mathbf{x}) = f_L \circ f_{L-1} \circ \cdots \circ f_1(\mathbf{x}), \quad L = 8 $$
+    </div>
+    <table class="config-table">
+      <tr><td>流层数</td><td>8（每层 = ActNorm + RotConv + Coupling = 24 个子层）</td></tr>
+      <tr><td>Coupling 隐藏层</td><td>256</td></tr>
+      <tr><td>Flow 套数</td><td>2（Flow_cls + Flow_view）</td></tr>
+      <tr><td>维度</td><td>256</td></tr>
+    </table>
+  </div>
+</div>
+
+<!-- 5. Loss -->
+<div class="module-card">
+  <div class="module-header">
+    <span class="module-badge badge-5">5</span>
+    <span class="module-title">训练损失：z 空间距离 + 方差正则</span>
+  </div>
+  <div class="module-body">
+    <p>核心思想：正常样本经 Flow 映射后 z 应接近标准高斯原点（‖z‖小），训练时最小化 z 到原点的距离。<strong>去掉了经典 NLL 中的 log_det 项</strong>，防止 Flow 通过膨胀雅可比行列式使 NLL 变负作弊。</p>
+    <div class="formula-box">
+      <div class="formula-label">z 空间距离（主损失）</div>
+      $$ \mathcal{L}_{\text{cls}} = \frac{1}{2}\|\mathbf{z}_{\text{cls}}\|^2 = \frac{1}{2}\sum_{i=1}^{D} z_{\text{cls},i}^2 $$
+      $$ \mathcal{L}_{\text{view}} = \frac{1}{2}\|\mathbf{z}_{\text{view}}\|^2 = \frac{1}{2}\sum_{i=1}^{D} z_{\text{view},i}^2 $$
+      <div class="formula-label" style="margin-top:14px;">方差正则化（辅助）</div>
+      $$ \mathcal{L}_{\text{var}} = \frac{1}{D}\sum_{i=1}^{D}(\text{Var}(\mathbf{z}_{\cdot,i}) - 1)^2 $$
+      <div class="formula-label" style="margin-top:14px;">总损失</div>
+      $$ \mathcal{L} = \lambda_{\text{cls}}\,\mathcal{L}_{\text{cls}} + \lambda_{\text{view}}\,\mathcal{L}_{\text{view}} + \lambda_{\text{var}}\,\mathcal{L}_{\text{var}} $$
+    </div>
+    <table class="config-table">
+      <tr><td>λ_cls</td><td>1.0</td></tr>
+      <tr><td>λ_view</td><td>0.5</td></tr>
+      <tr><td>λ_var</td><td>0.1</td></tr>
+      <tr><td>优化器</td><td>AdamW (lr=1e-4, wd=1e-5)</td></tr>
+      <tr><td>调度器</td><td>Cosine Annealing (5 epoch warmup)</td></tr>
+      <tr><td>混合精度</td><td>AMP FP16</td></tr>
+    </table>
+    <div class="param-info">
+      <strong>设计动机：</strong>经典 NLL = ½‖z‖² − log|det J|，Flow 可以通过增大 log|det J| 使 NLL → −∞ 而不学习有意义的映射。去掉 log_det 后，训练信号与推理评分完全一致（z 空间 L2 距离），避免训练-推理不一致。
+    </div>
+  </div>
+</div>
+
+<!-- 6. Inference Scoring -->
+<div class="module-card">
+  <div class="module-header">
+    <span class="module-badge badge-6">6</span>
+    <span class="module-title">推理异常评分</span>
+  </div>
+  <div class="module-body">
+    <p>推理时使用三路融合评分。图像级得分由 Flow z 空间距离主导，像素级得分由 k-NN + Flow patch 融合。</p>
+    <div class="formula-box">
+      <div class="formula-label">图像级得分（z 空间 L2 距离）</div>
+      $$ S_{\text{image}} = \underbrace{\|\mathbf{z}_{\text{cls}}\|_2}_{\text{全局异常}} + \underbrace{\frac{1}{V}\sum_{v=1}^{V}\|\mathbf{z}_{\text{view}}^{(v)}\|_2}_{\text{视角均值异常}} $$
+      <div class="formula-label" style="margin-top:14px;">像素级 k-NN 异常图</div>
+      $$ S_{\text{kNN}}^{(v,n)} = 1 - \frac{1}{k}\sum_{j \in \text{kNN}} \cos\big(\mathbf{f}^{(v,n)},\; \mathbf{m}_j\big) $$
+      <p style="font-size:0.85em; color:var(--text-dim); margin-top:4px;">f = 测试 patch 特征（多尺度拼接 1536 维），m = memory bank 中的正常特征</p>
+      <div class="formula-label" style="margin-top:14px;">Flow patch 异常得分</div>
+      $$ S_{\text{flow}}^{(v,n)} = \|\mathbf{p}^{(v,n)} - \bar{\mathbf{p}}\|_2, \quad \bar{\mathbf{p}} = \frac{1}{VN}\sum_{v,n}\mathbf{p}^{(v,n)} $$
+      <p style="font-size:0.85em; color:var(--text-dim); margin-top:4px;">p = patch_head 编码后的特征，偏离全局均值越远越异常</p>
+      <div class="formula-label" style="margin-top:14px;">像素级融合 + 后处理</div>
+      $$ S_{\text{pixel}} = 0.8 \cdot \text{norm}(S_{\text{kNN}}) + 0.2 \cdot \text{norm}(S_{\text{flow}}) $$
+      $$ \xrightarrow{\text{上采样}} \xrightarrow{\text{高斯平滑}\,\sigma=2} \xrightarrow{\text{百分位截断}\,P_{30}=0} \xrightarrow{\text{全局归一化}} \text{mask} $$
+    </div>
+  </div>
+</div>
+
+</div><!-- /modules -->
+
+<!-- ═══════════════ Summary ═══════════════ -->
+<div class="summary">
+  <h2>架构设计要点</h2>
+  <ul>
+    <li><span class="num">1</span><span><strong>冻结 DINOv2</strong>：利用自监督预训练的强大特征提取能力，无需微调即可获得高质量 patch 表示</span></li>
+    <li><span class="num">2</span><span><strong>多尺度融合</strong>：拼接浅层纹理 (layer 9) + 深层语义 (layer 11)，兼顾局部缺陷与全局异常</span></li>
+    <li><span class="num">3</span><span><strong>跨视角 Transformer</strong>：5 视角 × 1369 patch = 6846 token 的长序列建模，同时捕捉视角内空间关系和视角间对应关系</span></li>
+    <li><span class="num">4</span><span><strong>旋转矩阵替代 slogdet</strong>：用 D/2 个可学习角度的 2D 旋转替代正交矩阵，log_det 恒为 0，避免 RTX 50 系列 CUDA slogdet hang</span></li>
+    <li><span class="num">5</span><span><strong>去掉 log_det 的 NLL</strong>：训练信号 = ½‖z‖²，与推理评分（z 空间 L2 距离）完全一致，防止 Flow 通过膨胀雅可比行列式作弊</span></li>
+    <li><span class="num">6</span><span><strong>方差正则化</strong>：推动 z 各维度方差接近 1，使分布更接近标准高斯，提升异常检测的区分度</span></li>
+    <li><span class="num">7</span><span><strong>三路融合评分</strong>：图像级用 Flow z 距离 + k-NN，像素级用 k-NN + Flow patch 融合，互补提升 AP 和 F1max</span></li>
+  </ul>
+</div>
+
+</div>
+</body>
+</html>

@@ -103,27 +103,47 @@ class AffineCoupling(nn.Module):
 
 class Invertible1x1Conv(nn.Module):
     """
-    Glow 风格的可逆 1×1 卷积
-    用正交矩阵初始化，替代固定随机排列，表达力更强
-    log_det = log|det(W)|，与输入无关
+    可学习的可逆维度混合层
+    用 dim//2 个旋转矩阵参数化，每个旋转作用于一对维度 (2i, 2i+1)
+    优点:
+    - 无需 slogdet（旋转矩阵 det=1，log_det=0）
+    - FP16 友好，不会 NaN
+    - 表达力强于固定 Permute
     """
 
     def __init__(self, dim: int):
         super().__init__()
         self.dim = dim
-        # 正交初始化
-        W = torch.linalg.qr(torch.randn(dim, dim))[0]
-        self.W = nn.Parameter(W)
+        assert dim % 2 == 0, f"dim 必须为偶数, 得到 {dim}"
+        # dim//2 个旋转角度，随机初始化
+        self.angles = nn.Parameter(torch.randn(dim // 2) * 0.01)
+
+    def _get_cos_sin(self):
+        c = torch.cos(self.angles)  # [D/2]
+        s = torch.sin(self.angles)  # [D/2]
+        return c, s
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # x: [B, D] → [B, D] @ W
-        y = F.linear(x, self.W)
-        # 必须在 float32 下算 slogdet，FP16 下可能返回 NaN
-        _, log_det = torch.slogdet(self.W.float())
-        return y, log_det.expand(x.size(0))
+        # x: [B, D] → 对每对维度应用旋转
+        c, s = self._get_cos_sin()  # [D/2]
+        x_even = x[..., 0::2]  # [B, D/2] 偶数维度
+        x_odd = x[..., 1::2]   # [B, D/2] 奇数维度
+        y_even = c * x_even - s * x_odd
+        y_odd = s * x_even + c * x_odd
+        # 交错合并回来
+        y = torch.stack([y_even, y_odd], dim=-1).reshape_as(x)
+        # 旋转矩阵 det=1, log_det=0
+        log_det = torch.zeros(x.size(0), device=x.device, dtype=x.dtype)
+        return y, log_det
 
     def inverse(self, y: torch.Tensor) -> torch.Tensor:
-        return F.linear(y, self.W.t())
+        # 旋转的逆 = 反向旋转
+        c, s = self._get_cos_sin()
+        y_even = y[..., 0::2]
+        y_odd = y[..., 1::2]
+        x_even = c * y_even + s * y_odd
+        x_odd = -s * y_even + c * y_odd
+        return torch.stack([x_even, x_odd], dim=-1).reshape_as(y)
 
 
 class NormalizingFlow(nn.Module):

@@ -450,15 +450,15 @@ class INPFormer(nn.Module):
 
         # 2. Normalizing Flow: CLS 特征
         z_cls, log_det_cls = self.flow_cls(cls_out)
-        log_pz_cls = -0.5 * (z_cls ** 2).sum(dim=-1) - 0.5 * z_cls.size(-1) * math.log(2 * math.pi)
-        nll_cls = -(log_pz_cls + log_det_cls)  # [B]
+        # 用 z 空间距离作为训练信号（去掉 log_det，防止 Flow 通过膨胀 log_det 作弊）
+        # 推理时 anomaly_score 也用 z 空间 L2 距离，训练和推理保持一致
+        nll_cls = 0.5 * (z_cls ** 2).sum(dim=-1)  # [B]
 
         # 3. Normalizing Flow: 视角特征
         B, V, D = view_tokens.shape
         view_flat = view_tokens.reshape(B * V, D)
         z_view_flat, log_det_view_flat = self.flow_view(view_flat)
-        log_pz_view = -0.5 * (z_view_flat ** 2).sum(dim=-1) - 0.5 * D * math.log(2 * math.pi)
-        nll_view_flat = -(log_pz_view + log_det_view_flat)
+        nll_view_flat = 0.5 * (z_view_flat ** 2).sum(dim=-1)
         nll_view = nll_view_flat.reshape(B, V)  # [B, V]
 
         z_view = z_view_flat.reshape(B, V, D)

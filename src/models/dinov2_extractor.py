@@ -331,12 +331,15 @@ class DINOv2Extractor(nn.Module):
             x, n_last_blocks=len(self.out_indices)
         )
 
+
         return {
-            "cls_token": cls_token,
-            "patch_features": patch_features_list[-1],
-            "multi_scale_features": list(patch_features_list),
-            "num_patches_h": n_h,
-            "num_patches_w": n_w,
+            "cls_token": cls_token, # 含义：ViT 第 12 层（最后一层）经过最终 LayerNorm 后的 CLS token，是对整张图像的全局语义摘要。
+            "patch_features": patch_features_list[-1], # 最后一层（block 11）的 patch 序列输出（经 LayerNorm）。1369 个 patch 各有一个 768 维向量，包含最深层语义信息。
+            "multi_scale_features": list(patch_features_list), # ViT 最后 4 层（block 8, 9, 10, 11）的 patch 输出，构成一个 4 元素列表。
+            # 每层捕捉不同抽象程度的特征（局部纹理、边缘、颜色；局部部件、形状模式；物体部件、语义概念； 
+            # 全局语义 （= patch_features））
+            "num_patches_h": n_h, # 图像高度被切成多少个 patch。计算方式：518 // 14 = 37（14 为 patch_size）。
+            "num_patches_w": n_w, # 同上，宽度方向。两者相乘 n_h × n_w = 37 × 37 = 1369 = N，即总 patch 数。 
         }
 
     @torch.no_grad()

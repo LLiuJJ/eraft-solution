@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>INP-Former 架构图</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+    background: #ffffff;
+    color: #24292f;
+    padding: 40px 20px;
+  }
+  .wrap { max-width: 900px; margin: 0 auto; }
+  h1 {
+    text-align: center;
+    font-size: 1.8em;
+    margin-bottom: 30px;
+    color: #24292f;
+  }
+
+  /* ── Pipeline ── */
+  .pipeline {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0;
+  }
+  .block {
+    width: 520px;
+    border: 1.5px solid;
+    border-radius: 8px;
+    padding: 14px 20px;
+    text-align: center;
+    position: relative;
+  }
+  .block .name { font-weight: 700; font-size: 1.05em; color: #24292f; }
+  .block .desc { color: #57606a; font-size: 0.8em; margin-top: 4px; }
+  .block .shape {
+    font-family: "SF Mono", Consolas, monospace;
+    font-size: 0.75em;
+    color: #57606a;
+    margin-top: 4px;
+  }
+  .arrow {
+    width: 1.5px; height: 28px;
+    background: #8c959f;
+    position: relative;
+  }
+  .arrow::after {
+    content: '';
+    position: absolute;
+    bottom: -5px; left: -4.5px;
+    width: 0; height: 0;
+    border-left: 5px solid transparent;
+    border-right: 5px solid transparent;
+    border-top: 7px solid #8c959f;
+  }
+
+  /* color schemes — paper style */
+  .b-in    { border-color: #8c959f; background: #f6f8fa; }
+  .b-dino  { border-color: #0969da; background: #ddf4ff; }
+  .b-enc   { border-color: #1a7f37; background: #dafbe1; }
+  .b-flow  { border-color: #bf8700; background: #fff8c5; }
+  .b-out   { border-color: #8250df; background: #f6f8fa; }
+  .b-score { border-color: #8250df; background: #fbefff; }
+
+  /* tag */
+  .tag {
+    display: inline-block;
+    padding: 1px 8px;
+    border-radius: 12px;
+    font-size: 0.65em;
+    font-weight: 600;
+    margin-left: 6px;
+    vertical-align: middle;
+  }
+  .tag-frozen { background: #f6f8fa; color: #57606a; border: 1px solid #d0d7de; }
+  .tag-train  { background: #dafbe1; color: #1a7f37; border: 1px solid #1a7f37; }
+
+  /* parallel row */
+  .row {
+    display: flex;
+    gap: 16px;
+    width: 100%;
+    justify-content: center;
+  }
+  .row .block { width: 250px; }
+
+  /* region box with title */
+  .region {
+    border: 2px dashed #1a7f37;
+    border-radius: 12px;
+    padding: 28px 20px 20px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0;
+    position: relative;
+    width: 100%;
+    max-width: 560px;
+    background: #fbfdfc;
+  }
+  .region-title {
+    position: absolute;
+    top: -14px; left: 50%;
+    transform: translateX(-50%);
+    background: #ffffff;
+    padding: 2px 16px;
+    font-size: 0.9em;
+    font-weight: 700;
+    color: #1a7f37;
+    border: 1.5px solid #1a7f37;
+    border-radius: 20px;
+    white-space: nowrap;
+  }
+
+  /* legend */
+  .legend {
+    display: flex;
+    gap: 24px;
+    justify-content: center;
+    margin-top: 30px;
+    font-size: 0.8em;
+    color: #57606a;
+    flex-wrap: wrap;
+  }
+  .legend-item { display: flex; align-items: center; gap: 6px; }
+  .legend-dot {
+    width: 14px; height: 14px;
+    border-radius: 4px;
+    border: 1.5px solid;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>DINOv2 + INP-Former 架构图</h1>
+
+<div class="pipeline">
+
+  <!-- 输入 -->
+  <div class="block b-in">
+    <div class="name">输入：多视角图像</div>
+    <div class="desc">5 个视角 × RGB × 518×518</div>
+    <div class="shape">[B, 5, 3, 518, 518]</div>
+  </div>
+  <div class="arrow"></div>
+
+  <!-- DINOv2 -->
+  <div class="block b-dino">
+    <div class="name">DINOv2 ViT-B/14 <span class="tag tag-frozen">冻结</span></div>
+    <div class="desc">自监督预训练特征提取 · 12 层 Transformer</div>
+    <div class="shape">→ cls_tokens [B, 5, 768]<br>→ patch_features [B, 5, 1369, 768]<br>→ multi_scale_features (4 层)</div>
+  </div>
+  <div class="arrow"></div>
+
+  <!-- INP-Former 区域 -->
+  <div class="region">
+    <div class="region-title">INP-Former <span style="font-size:0.75em; font-weight:400; color:#57606a;">(可逆神经过程 Transformer)</span></div>
+
+    <!-- ViewPatchEncoder -->
+    <div class="block b-enc">
+      <div class="name">ViewPatchEncoder <span class="tag tag-train">可训练</span></div>
+      <div class="desc">多视角 Transformer · 4 层 · 8 头注意力</div>
+      <div class="desc">投影 1536→256 + 位置编码 + 视角嵌入</div>
+      <div class="shape">→ cls_out [B, 256]<br>→ view_tokens [B, 5, 256]<br>→ patch_map [B, 5, 1369, 256]</div>
+    </div>
+    <div class="arrow"></div>
+
+    <!-- LayerNorm -->
+    <div class="block" style="border-color: #d0d7de; width: 300px; background: #f6f8fa;">
+      <div class="name">LayerNorm</div>
+      <div class="desc">稳定 Flow 输入分布</div>
+    </div>
+    <div class="arrow"></div>
+
+    <!-- 双 Flow -->
+    <div class="row">
+      <div class="block b-flow">
+        <div class="name">Flow_cls <span class="tag tag-train">可训练</span></div>
+        <div class="desc">Normalizing Flow ×8 层</div>
+        <div class="desc">ActNorm → 旋转 → Coupling</div>
+        <div class="shape">z_cls [B, 256]</div>
+      </div>
+      <div class="block b-flow">
+        <div class="name">Flow_view <span class="tag tag-train">可训练</span></div>
+        <div class="desc">Normalizing Flow ×8 层</div>
+        <div class="desc">ActNorm → 旋转 → Coupling</div>
+        <div class="shape">z_view [B, 5, 256]</div>
+      </div>
+    </div>
+
+  </div><!-- /INP-Former region -->
+  <div class="arrow"></div>
+
+  <!-- 输出 -->
+  <div class="block b-out">
+    <div class="name">输出</div>
+    <div class="desc">z 空间 L2 距离 = 异常得分</div>
+    <div class="shape">image_score = ‖z_cls‖ + mean(‖z_view‖)<br>patch_score = k-NN + Flow 融合</div>
+  </div>
+  <div class="arrow"></div>
+
+  <!-- 最终结果 -->
+  <div class="block b-score">
+    <div class="name">比赛提交</div>
+    <div class="desc">submission.csv + predicted_masks/</div>
+    <div class="shape">图像级 anomaly_score<br>像素级 448×448 mask</div>
+  </div>
+
+</div><!-- /pipeline -->
+
+<!-- Legend -->
+<div class="legend">
+  <div class="legend-item">
+    <div class="legend-dot" style="border-color: #0969da; background: #ddf4ff;"></div>
+    <span>DINOv2（冻结）</span>
+  </div>
+  <div class="legend-item">
+    <div class="legend-dot" style="border-color: #1a7f37; background: #dafbe1;"></div>
+    <span>INP-Former（可训练）</span>
+  </div>
+  <div class="legend-item">
+    <div class="legend-dot" style="border-color: #bf8700; background: #fff8c5;"></div>
+    <span>Normalizing Flow</span>
+  </div>
+  <div class="legend-item">
+    <div class="legend-dot" style="border-color: #8c959f; background: #f6f8fa;"></div>
+    <span>输入 / 输出</span>
+  </div>
+</div>
+
+</div>
+</body>
+</html>

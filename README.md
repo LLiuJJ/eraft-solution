@@ -260,6 +260,38 @@ uv run python -m src.submit --help
 --output_dir DIR          输出目录（默认 submission）
 ```
 
+## 异常检测结果展示
+
+以下展示测试集 Top-6 异常样本的检测结果。每张图包含 5 个视角，每行 3 列：**原图 | 异常热力图 | 黑白 mask**。
+
+热力图使用 jet colormap 叠加到原图上（蓝色=正常，红色=异常），mask 为灰度图（与提交格式一致）。
+
+### Demo 1
+
+![异常检测 Demo 1](img/combined_demo1.png)
+
+### Demo 2
+
+![异常检测 Demo 2](img/combined_demo2.png)
+
+### Demo 3
+
+![异常检测 Demo 3](img/combined_demo3.png)
+
+### Demo 4
+
+![异常检测 Demo 4](img/combined_demo4.png)
+
+### Demo 5
+
+![异常检测 Demo 5](img/combined_demo5.png)
+
+### Demo 6
+
+![异常检测 Demo 6](img/combined_demo6.png)
+
+> 以上结果通过 `src/visualize.py` 生成，使用 k-NN + Flow patch 得分融合 + 百分位截断后处理。
+
 ## 项目结构
 
 ```

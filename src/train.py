@@ -87,14 +87,31 @@ def train_one_epoch(
     for batch_idx, batch in enumerate(dataloader):
         views = batch["views"].to(device, non_blocking=True)  # [B, V, C, H, W]
 
+        if batch_idx == 0:
+            print(f"  [batch 0] views={list(views.shape)}, dtype={views.dtype}, device={views.device}")
+
         # 1. DINOv2 提取特征（冻结，无梯度）
         with torch.no_grad():
             dinov2_feats = dinov2.extract_multi_view(views)
 
+        if batch_idx == 0:
+            pf = dinov2_feats["patch_features"]
+            ms = dinov2_feats.get("multi_scale_features", [])
+            print(f"  [batch 0] DINOv2: patch={list(pf.shape)}, ms_layers={len(ms)}")
+
         # 2 + 3. INP-Former 前向 + 损失计算（AMP 自动混合精度）
-        with torch.cuda.amp.autocast(enabled=use_amp):
-            outputs = model(dinov2_feats)
-            losses = criterion(outputs)
+        try:
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                outputs = model(dinov2_feats)
+                losses = criterion(outputs)
+        except Exception as e:
+            print(f"\n!!! 前向传播失败 (batch {batch_idx}): {e}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
+
+        if batch_idx == 0:
+            print(f"  [batch 0] loss={losses['total_loss']:.4f}, 开始反向传播...")
 
         # 4. 反向传播
         optimizer.zero_grad(set_to_none=True)
@@ -240,10 +257,21 @@ def main():
         print(f"DINOv2 权重: {cfg.dinov2.weights_path}")
     print(f"{'='*60}\n")
 
+    # 诊断: DataLoader 是否正常
+    n_batches = len(train_loader)
+    print(f"DataLoader: {len(train_loader.dataset)} 样本, {n_batches} 个 batch (batch_size={cfg.data.batch_size})")
+    if n_batches == 0:
+        print("错误: DataLoader 没有 batch，请检查数据目录")
+        sys.exit(1)
+
+    print(f"start_epoch={start_epoch}, total_epochs={cfg.train.epochs}")
+    print(f"循环将执行: range({start_epoch}, {cfg.train.epochs}) = {cfg.train.epochs - start_epoch} 个 epoch")
+
     best_loss = float("inf")
 
     for epoch in range(start_epoch, cfg.train.epochs):
         t0 = time.time()
+        print(f"\n>>> Epoch {epoch} 开始...", flush=True)
 
         metrics = train_one_epoch(
             epoch, dinov2, model, train_loader, criterion,

@@ -118,12 +118,11 @@ class Invertible1x1Conv(nn.Module):
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         # x: [B, D] → [B, D] @ W
         y = F.linear(x, self.W)
-        # log_det = log|det(W)|，对每个样本相同
-        log_det = torch.slogdet(self.W)[1].expand(x.size(0))
-        return y, log_det
+        # 必须在 float32 下算 slogdet，FP16 下可能返回 NaN
+        _, log_det = torch.slogdet(self.W.float())
+        return y, log_det.expand(x.size(0))
 
     def inverse(self, y: torch.Tensor) -> torch.Tensor:
-        # W^{-1} = W^T (正交矩阵)
         return F.linear(y, self.W.t())
 
 

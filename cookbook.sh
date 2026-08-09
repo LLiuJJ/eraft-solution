@@ -1,2 +1,2 @@
-uv run python -m src.train   --category effect_transistor   --epochs 100   --batch_size 8   --image_size 518   --num_workers 8   --dinov2_weights weights/dinov2_vitb14_pretrain.pth
-uv run python -m src.submit   --checkpoint checkpoints/effect_transistor/best.pth   --test_split Test_A   --category effect_transistor   --image_size 518   --batch_size 8   --num_workers 8   --dinov2_weights weights/dinov2_vitb14_pretrain.pth
+uv run python -m src.train   --epochs 100   --batch_size 4   --image_size 518   --num_workers 8   --dinov2_weights weights/dinov2_vitb14_pretrain.pth
+

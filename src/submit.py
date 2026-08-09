@@ -47,7 +47,7 @@ from src.models.inpformer import INPFormer
 
 # ── 常量 ─────────────────────────────────────────────────────────
 MASK_SIZE = 448  # 比赛要求的 mask 尺寸
-MEMORY_BANK_MAX = 2000  # 每个类别 memory bank 最大特征数
+MEMORY_BANK_MAX = 5000  # P1-F: 增大 memory bank (2000→5000)
 K_NEIGHBORS = 5  # k-NN 近邻数
 
 
@@ -70,7 +70,37 @@ def parse_args():
                    help="k-NN 近邻数")
     p.add_argument("--memory_bank_max", type=int, default=MEMORY_BANK_MAX,
                    help="每个类别 memory bank 最大特征数")
+    p.add_argument("--no_multiscale", action="store_true",
+                   help="禁用多尺度特征融合（仅用最后一层）")
+    p.add_argument("--smooth_sigma", type=float, default=4.0,
+                   help="异常图高斯平滑 σ (0=不平滑)")
+    p.add_argument("--alpha_flow", type=float, default=0.3,
+                   help="图像级融合权重: Flow 信号")
+    p.add_argument("--alpha_knn", type=float, default=0.4,
+                   help="图像级融合权重: k-NN 信号")
+    p.add_argument("--alpha_pixel", type=float, default=0.3,
+                   help="图像级融合权重: 像素级 max 信号")
     return p.parse_args()
+
+
+# ── P1-B: 多尺度特征提取 ────────────────────────────────────────
+
+def get_multiscale_patches(dinov2_feats: dict) -> torch.Tensor:
+    """
+    P1-B: 拼接 DINOv2 最后两层的 patch 特征，融合浅层纹理 + 深层语义
+
+    Args:
+        dinov2_feats: extract_multi_view() 的输出，包含 multi_scale_features
+
+    Returns:
+        patches: [B, V, N, 2*D]  拼接后的多尺度特征
+    """
+    ms = dinov2_feats["multi_scale_features"]  # List[[B, V, N, D]]
+    # 取最后两层（语义层 + 深层）
+    layer_a = ms[-2]  # 倒数第二层
+    layer_b = ms[-1]  # 最后一层
+    fused = torch.cat([layer_a, layer_b], dim=-1)  # [B, V, N, 2D]
+    return fused
 
 
 # ── Phase 1: 构建 Memory Bank ─────────────────────────────────────
@@ -83,13 +113,13 @@ def build_memory_bank(
     max_features: int = MEMORY_BANK_MAX,
 ) -> dict:
     """
-    扫描训练集，为每个类别构建 DINOv2 patch 特征的 memory bank
+    扫描训练集，为每个类别构建多尺度 DINOv2 patch 特征的 memory bank
 
     Returns:
-        dict: {category_name: Tensor[max_features, dinov2_dim]}
+        dict: {category_name: Tensor[max_features, 2*dinov2_dim]}
     """
-    print("\n[Phase 1] 构建 Memory Bank...")
-    bank = {}  # {category: Tensor[≤max_features, D]}
+    print("\n[Phase 1] 构建 Memory Bank (多尺度特征)...")
+    bank = {}  # {category: Tensor[≤max_features, 2D]}
 
     # 逐 batch 扫描，对每个类别增量收集并截断
     for batch_idx, batch in enumerate(tqdm(train_loader, desc="  扫描训练集")):
@@ -98,13 +128,13 @@ def build_memory_bank(
         B, V = views.shape[0], views.shape[1]
 
         dinov2_feats = dinov2.extract_multi_view(views)
-        patch_features = dinov2_feats["patch_features"]  # [B, V, N, D]
+        # P1-B: 使用多尺度拼接特征
+        ms_patches = get_multiscale_patches(dinov2_feats)  # [B, V, N, 2D]
 
         for i in range(B):
             cat = categories[i]
-            # 每个样本随机采样部分 patch（避免内存爆炸）
-            patches = patch_features[i].reshape(-1, patch_features.shape[-1])  # [V*N, D]
-            sample_k = min(patches.shape[0], max_features // 5)  # 每个样本最多取 1/5
+            patches = ms_patches[i].reshape(-1, ms_patches.shape[-1])  # [V*N, 2D]
+            sample_k = min(patches.shape[0], max_features // 5)
             if patches.shape[0] > sample_k:
                 idx = torch.randperm(patches.shape[0], device=device)[:sample_k]
                 patches = patches[idx]
@@ -114,18 +144,16 @@ def build_memory_bank(
                 bank[cat] = patches_cpu
             else:
                 bank[cat] = torch.cat([bank[cat], patches_cpu], dim=0)
-                # 超过上限时随机截断
                 if bank[cat].shape[0] > max_features:
                     idx = torch.randperm(bank[cat].shape[0])[:max_features]
                     bank[cat] = bank[cat][idx]
 
-        # 释放 GPU 显存
-        del dinov2_feats, patch_features
+        del dinov2_feats, ms_patches
 
     # L2 归一化并移到 GPU
     for cat in bank:
         bank[cat] = F.normalize(bank[cat], dim=-1).to(device)
-        print(f"  {cat}: {bank[cat].shape[0]} 个特征")
+        print(f"  {cat}: {bank[cat].shape[0]} 个特征, dim={bank[cat].shape[1]}")
 
     print(f"[Phase 1] 完成，共 {len(bank)} 个类别\n")
     return bank
@@ -176,9 +204,10 @@ def generate_pixel_mask(
     n_h: int,                    # 水平 patch 数
     n_w: int,                    # 垂直 patch 数
     mask_size: int = MASK_SIZE,
+    smooth_sigma: float = 4.0,   # P1-H: 高斯平滑 σ (0=不平滑)
 ) -> np.ndarray:
     """
-    将 patch 级异常得分上采样为像素级 mask
+    将 patch 级异常得分上采样为像素级 mask，并应用高斯平滑
 
     Returns:
         masks: [V, mask_size, mask_size]  uint8 灰度图
@@ -196,7 +225,21 @@ def generate_pixel_mask(
         align_corners=False,
     )  # [V, 1, mask_size, mask_size]
 
-    # 3. 逐视角归一化到 [0, 255]
+    # 3. P1-H: 高斯平滑，消除 patch 级棋盘格效应
+    if smooth_sigma > 0:
+        kernel_size = max(5, int(smooth_sigma * 4) | 1)  # 确保奇数
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+        x = torch.arange(kernel_size, dtype=torch.float32) - kernel_size // 2
+        gauss_1d = torch.exp(-0.5 * (x / smooth_sigma) ** 2)
+        gauss_1d = gauss_1d / gauss_1d.sum()
+        gauss_2d = gauss_1d.unsqueeze(1) @ gauss_1d.unsqueeze(0)  # [K, K]
+        gauss_2d = gauss_2d.unsqueeze(0).unsqueeze(0)  # [1, 1, K, K]
+        gauss_2d = gauss_2d.to(upsampled.device)
+        pad = kernel_size // 2
+        upsampled = F.conv2d(upsampled, gauss_2d, padding=pad)
+
+    # 4. 逐视角归一化到 [0, 255]
     masks = upsampled.squeeze(1)  # [V, mask_size, mask_size]
     result = np.zeros((V, mask_size, mask_size), dtype=np.uint8)
 
@@ -223,6 +266,11 @@ def run_inference(
     device: torch.device,
     output_dir: str,
     k_neighbors: int = K_NEIGHBORS,
+    alpha_flow: float = 0.3,
+    alpha_knn: float = 0.4,
+    alpha_pixel: float = 0.3,
+    use_multiscale: bool = True,   # P1-B: 是否使用多尺度特征
+    smooth_sigma: float = 4.0,     # P1-H: 异常图平滑 σ
 ) -> list:
     """
     在测试集上推理，生成 submission.csv 和 predicted_masks/
@@ -237,8 +285,9 @@ def run_inference(
     mask_dir.mkdir(parents=True, exist_ok=True)
 
     csv_rows = []
-    all_results = []
-    raw_scores = []
+    raw_flow_scores = []   # Flow z 空间 L2 距离
+    raw_knn_scores = []    # Memory Bank k-NN 最大距离
+    raw_pixel_scores = []  # 像素级最大得分
     total = len(dataloader)
     missing_cats = set()
 
@@ -254,45 +303,45 @@ def run_inference(
         n_h = dinov2_feats["num_patches_h"]
         n_w = dinov2_feats["num_patches_w"]
 
-        # ── 2. INP-Former 推理（图像级得分）──
+        # ── 2. INP-Former 推理（Flow 图像级得分）──
         out = model(dinov2_feats)
 
-        # ── 3. 图像级异常得分（z 空间 L2 距离）──
+        # ── 3. Flow 图像级得分（z 空间 L2 距离）──
         z_cls = out["z_cls"]          # [B, d_model]
         z_view = out["z_view"]        # [B, V, d_model]
         cls_dist = torch.norm(z_cls, dim=-1)
         view_dist = torch.norm(z_view, dim=-1).mean(dim=-1)
-        image_score = cls_dist + view_dist  # [B]
+        flow_score = cls_dist + view_dist  # [B]
 
-        # ── 4. 像素级异常得分（Memory Bank k-NN）──
+        # ── 4. 像素级异常得分 + Memory Bank k-NN 图像级得分 ──
         for i in range(B):
             cat = categories[i]
             sid = sample_ids[i]
             group_folder = f"{cat}/{sid}"
-            score = image_score[i].item()
 
-            raw_scores.append(score)
-            csv_rows.append({
-                "group_folder": group_folder,
-                "raw_score": score,
-            })
-
-            # 生成像素 mask
-            sample_mask_dir = mask_dir / cat / sid
-            sample_mask_dir.mkdir(parents=True, exist_ok=True)
-
+            # 像素级 k-NN 异常图
             if cat in memory_bank:
-                # 用 memory bank 计算 k-NN 距离
-                test_patches = patch_features[i]  # [V, N, D_dino]
+                if use_multiscale:
+                    # P1-B: 多尺度拼接特征
+                    ms = dinov2_feats["multi_scale_features"]
+                    test_patches = torch.cat(
+                        [ms[-2][i], ms[-1][i]], dim=-1
+                    )  # [V, N, 2D]
+                else:
+                    test_patches = patch_features[i]  # [V, N, D]
                 ps = compute_patch_anomaly_score(
                     test_patches, memory_bank[cat], k=k_neighbors
-                )
+                )  # [V, N]
+                # 图像级 k-NN 信号：每个视角 top-10% patch 的平均距离
+                V_s, N_s = ps.shape
+                k_top = max(1, N_s // 10)
+                topk_vals, _ = ps.topk(k_top, dim=-1)  # [V, k_top]
+                knn_score = topk_vals.mean().item()  # 标量
+                pixel_max = ps.max().item()
             else:
-                # 未见类别：回退到 Transformer 编码特征
                 if cat not in missing_cats:
                     print(f"  [警告] 类别 '{cat}' 无 memory bank，使用回退方案")
                     missing_cats.add(cat)
-                # 使用 encoded patch 特征与 CLS 的距离
                 encoded = out["patch_map"]  # [B, V, N, d_model]
                 cls_feat = out["z_cls"][i]  # [d_model]
                 patch_feats = encoded[i]    # [V, N, d_model]
@@ -300,32 +349,54 @@ def run_inference(
                     patch_feats, cls_feat.unsqueeze(0).unsqueeze(0).expand_as(patch_feats), dim=-1
                 )
                 ps = 1.0 - cos_sim  # [V, N]
+                knn_score = 0.0
+                pixel_max = ps.max().item()
 
-            masks = generate_pixel_mask(ps, n_h, n_w)
+            # 收集原始得分
+            raw_flow_scores.append(flow_score[i].item())
+            raw_knn_scores.append(knn_score)
+            raw_pixel_scores.append(pixel_max)
 
+            csv_rows.append({
+                "group_folder": group_folder,
+            })
+
+            # 生成并保存像素 mask
+            sample_mask_dir = mask_dir / cat / sid
+            sample_mask_dir.mkdir(parents=True, exist_ok=True)
+            masks = generate_pixel_mask(ps, n_h, n_w, smooth_sigma=smooth_sigma)
             for v in range(V):
                 mask_path = sample_mask_dir / f"{v}_mask.png"
                 Image.fromarray(masks[v], mode="L").save(str(mask_path))
 
-            all_results.append({
-                "group_folder": group_folder,
-                "image_score": score,
-            })
-
         if (batch_idx + 1) % 10 == 0 or (batch_idx + 1) == total:
             print(f"  推理进度: {batch_idx + 1}/{total}")
 
-    # ── 5. Min-Max 归一化到 [0, 1] ──
-    score_min = min(raw_scores)
-    score_max = max(raw_scores)
-    score_range = score_max - score_min if score_max > score_min else 1.0
+    # ── 5. 三路融合 + Min-Max 归一化 ──
+    # 对每种信号分别做 min-max 归一化到 [0, 1]
+    def minmax_normalize(scores):
+        s_min, s_max = min(scores), max(scores)
+        rng = s_max - s_min if s_max > s_min else 1.0
+        return [(s - s_min) / rng for s in scores], s_min, s_max
 
-    for row in csv_rows:
-        normalized = (row["raw_score"] - score_min) / score_range
-        row["anomaly_score"] = f"{normalized:.6f}"
-        del row["raw_score"]
+    flow_norm, f_min, f_max = minmax_normalize(raw_flow_scores)
+    knn_norm, k_min, k_max = minmax_normalize(raw_knn_scores)
+    pixel_norm, p_min, p_max = minmax_normalize(raw_pixel_scores)
 
-    print(f"  得分归一化: raw [{score_min:.2f}, {score_max:.2f}] → [0, 1]")
+    # 三路融合
+    for idx, row in enumerate(csv_rows):
+        fused = (
+            alpha_flow * flow_norm[idx]
+            + alpha_knn * knn_norm[idx]
+            + alpha_pixel * pixel_norm[idx]
+        )
+        row["anomaly_score"] = f"{fused:.6f}"
+
+    print(f"  融合归一化:")
+    print(f"    Flow:  raw [{f_min:.2f}, {f_max:.2f}]")
+    print(f"    k-NN:  raw [{k_min:.4f}, {k_max:.4f}]")
+    print(f"    Pixel: raw [{p_min:.4f}, {p_max:.4f}]")
+    print(f"    权重: Flow={alpha_flow}, k-NN={alpha_knn}, Pixel={alpha_pixel}")
 
     return csv_rows
 
@@ -421,7 +492,12 @@ def main():
     print(f"[Phase 2] 开始推理 ({args.test_split})...")
     csv_rows = run_inference(
         dinov2, model, test_loader, memory_bank, device,
-        str(output_dir), k_neighbors=args.k_neighbors
+        str(output_dir), k_neighbors=args.k_neighbors,
+        alpha_flow=args.alpha_flow,
+        alpha_knn=args.alpha_knn,
+        alpha_pixel=args.alpha_pixel,
+        use_multiscale=not args.no_multiscale,
+        smooth_sigma=args.smooth_sigma,
     )
 
     # ── 生成 CSV ──

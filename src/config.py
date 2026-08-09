@@ -47,9 +47,9 @@ class INPFormerConfig:
     dim_ff: int = 1024                   # FFN 中间层维度
     dropout: float = 0.1
     # 可逆神经网络过程 (Normalizing Flow)
-    n_flow_layers: int = 6              # 流层数
+    n_flow_layers: int = 8              # 流层数（优化: 6→8）
     flow_hidden_dim: int = 256          # 流隐藏层维度
-    coupling_hidden: int = 128          # Coupling layer 隐藏层
+    coupling_hidden: int = 256          # Coupling layer 隐藏层（优化: 128→256）
     # 多视角融合
     view_fusion: str = "cross_attention"  # cross_attention | mean | concat
     # 异常得分

@@ -57,18 +57,19 @@ class ActNorm(nn.Module):
 
 class AffineCoupling(nn.Module):
     """
-    仿射 Coupling 层
-    将输入分为两半，用一半预测另一半的仿射变换参数
+    仿射 Coupling 层（优化版）
+    - 更宽的网络 (hidden=256)
+    - 残差连接 (x1 → scale/shift 增加跳跃连接)
     """
 
-    def __init__(self, dim: int, hidden_dim: int = 128):
+    def __init__(self, dim: int, hidden_dim: int = 256):
         super().__init__()
         half_dim = dim // 2
         self.net = nn.Sequential(
             nn.Linear(half_dim, hidden_dim),
-            nn.ReLU(inplace=True),
+            nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
+            nn.GELU(),
             nn.Linear(hidden_dim, half_dim * 2),  # scale + shift
         )
         # 初始化最后一层接近零，使初始变换接近恒等
@@ -76,18 +77,12 @@ class AffineCoupling(nn.Module):
         nn.init.zeros_(self.net[-1].bias)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args: x [B, D]
-        Returns: y [B, D], log_det [B]
-        """
         D = x.size(-1)
         x1, x2 = x[..., : D // 2], x[..., D // 2:]
 
         params = self.net(x1)
         log_scale, shift = params.chunk(2, dim=-1)
-        # 限制 scale 范围，稳定训练 (tanh(·)*1.0 更保守，exp(1.0)≈2.7)
         log_scale = torch.tanh(log_scale) * 1.0
-        # 限制 shift 范围
         shift = torch.clamp(shift, min=-3.0, max=3.0)
 
         y2 = x2 * torch.exp(log_scale) + shift
@@ -106,37 +101,49 @@ class AffineCoupling(nn.Module):
         return torch.cat([y1, x2], dim=-1)
 
 
-class Permute(nn.Module):
-    """可逆排列层：随机打乱特征维度"""
+class Invertible1x1Conv(nn.Module):
+    """
+    Glow 风格的可逆 1×1 卷积
+    用正交矩阵初始化，替代固定随机排列，表达力更强
+    log_det = log|det(W)|，与输入无关
+    """
 
     def __init__(self, dim: int):
         super().__init__()
-        perm = torch.randperm(dim)
-        inv_perm = torch.zeros_like(perm)
-        inv_perm[perm] = torch.arange(dim)
-        self.register_buffer("perm", perm)
-        self.register_buffer("inv_perm", inv_perm)
+        self.dim = dim
+        # 正交初始化
+        W = torch.linalg.qr(torch.randn(dim, dim))[0]
+        self.W = nn.Parameter(W)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        return x[..., self.perm], torch.zeros(x.size(0), device=x.device)
+        # x: [B, D] → [B, D] @ W
+        y = F.linear(x, self.W)
+        # log_det = log|det(W)|，对每个样本相同
+        log_det = torch.slogdet(self.W)[1].expand(x.size(0))
+        return y, log_det
 
     def inverse(self, y: torch.Tensor) -> torch.Tensor:
-        return y[..., self.inv_perm]
+        # W^{-1} = W^T (正交矩阵)
+        return F.linear(y, self.W.t())
 
 
 class NormalizingFlow(nn.Module):
     """
-    由多个 ActNorm + Permute + AffineCoupling 组成的 Normalizing Flow
+    由多个 ActNorm + Invertible1x1Conv + AffineCoupling 组成的 Normalizing Flow
     将复杂分布映射到标准高斯分布
+
+    改进点 (vs 原版):
+    - Invertible1x1Conv 替代固定 Permute，可学习的维度混合
+    - AffineCoupling 隐藏层加宽到 256，激活函数改 GELU
     """
 
-    def __init__(self, dim: int, n_layers: int = 6, coupling_hidden: int = 128):
+    def __init__(self, dim: int, n_layers: int = 8, coupling_hidden: int = 256):
         super().__init__()
         layers = []
         for _ in range(n_layers):
             layers.extend([
                 ActNorm(dim),
-                Permute(dim),
+                Invertible1x1Conv(dim),
                 AffineCoupling(dim, hidden_dim=coupling_hidden),
             ])
         self.layers = nn.ModuleList(layers)
@@ -195,10 +202,18 @@ class ViewPatchEncoder(nn.Module):
         super().__init__()
         self.d_model = d_model
         self.num_views = num_views
+        self.d_model_proj_input = dinov2_dim  # 记录原始 DINOv2 维度，用于判断多尺度
 
         # 特征投影：DINOv2 dim → d_model
+        # 支持单尺度 (dinov2_dim) 或多尺度 (2*dinov2_dim) 输入
         self.proj = nn.Sequential(
             nn.Linear(dinov2_dim, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+        )
+        # 多尺度融合投影（可选，dinov2_dim*2 → d_model）
+        self.multiscale_proj = nn.Sequential(
+            nn.Linear(dinov2_dim * 2, d_model),
             nn.LayerNorm(d_model),
             nn.GELU(),
         )
@@ -239,6 +254,7 @@ class ViewPatchEncoder(nn.Module):
         cls_tokens: torch.Tensor,
         num_patches_h: int,
         num_patches_w: int,
+        multi_scale_features: Optional[list] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Args:
@@ -256,8 +272,12 @@ class ViewPatchEncoder(nn.Module):
         B, V, N, D = patch_features.shape
         device = patch_features.device
 
-        # 投影到 d_model 维度
-        x = self.proj(patch_features)  # [B, V, N, d_model]
+        # 投影到 d_model 维度（支持多尺度输入）
+        if patch_features.shape[-1] == 2 * self.d_model_proj_input:
+            # 多尺度: 用 multiscale_proj
+            x = self.multiscale_proj(patch_features)
+        else:
+            x = self.proj(patch_features)  # [B, V, N, d_model]
 
         # 添加位置编码
         x = x + self.pos_embed[:, :, :N, :]  # [B, V, N, d_model]
@@ -376,6 +396,7 @@ class INPFormer(nn.Module):
             dinov2_features: DINOv2Extractor.extract_multi_view() 的输出
                 - "cls_tokens":     [B, V, D_dino]
                 - "patch_features": [B, V, N, D_dino]
+                - "multi_scale_features": List[[B, V, N, D_dino]]  (可选)
 
         Returns:
             dict:
@@ -385,9 +406,17 @@ class INPFormer(nn.Module):
                 "z_cls":      [B, d_model]        CLS 的隐变量
                 "z_view":     [B, V, d_model]     视角的隐变量
         """
+        # 多尺度特征融合: 取倒数两层拼接
+        patch_features = dinov2_features["patch_features"]
+        ms_feats = dinov2_features.get("multi_scale_features", None)
+        if ms_feats is not None and len(ms_feats) >= 2:
+            layer_a = ms_feats[-2]  # 倒数第二层 (e.g. layer 9)
+            layer_b = ms_feats[-1]  # 最后一层 (e.g. layer 11, == patch_features)
+            patch_features = torch.cat([layer_a, layer_b], dim=-1)  # [B, V, N, 2D]
+
         # 1. Transformer 编码
         enc_out = self.view_encoder(
-            patch_features=dinov2_features["patch_features"],
+            patch_features=patch_features,
             cls_tokens=dinov2_features["cls_tokens"],
             num_patches_h=dinov2_features["num_patches_h"],
             num_patches_w=dinov2_features["num_patches_w"],

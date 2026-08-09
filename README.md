@@ -19,15 +19,12 @@
 
 热力图使用 jet colormap 叠加到原图上（蓝色=正常，红色=异常），mask 为灰度图（与提交格式一致）。
 
-### Demo 1
 
 ![异常检测 Demo 1](img/combined_demo1.png)
 
-### Demo 2
 
 ![异常检测 Demo 2](img/combined_demo2.png)
 
-### Demo 3
 
 ![异常检测 Demo 3](img/combined_demo3.png)
 

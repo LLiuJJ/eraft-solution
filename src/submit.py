@@ -72,8 +72,12 @@ def parse_args():
                    help="每个类别 memory bank 最大特征数")
     p.add_argument("--no_multiscale", action="store_true",
                    help="禁用多尺度特征融合（仅用最后一层）")
-    p.add_argument("--smooth_sigma", type=float, default=4.0,
-                   help="异常图高斯平滑 σ (0=不平滑)")
+    p.add_argument("--smooth_sigma", type=float, default=2.0,
+                   help="异常图高斯平滑 σ (降低以保留边界细节)")
+    p.add_argument("--clip_percentile", type=float, default=30.0,
+                   help="得分截断百分位: 低于此值的像素得分置零 (0~100)")
+    p.add_argument("--flow_patch_weight", type=float, default=0.2,
+                   help="Flow patch 得分融合权重 (0=仅用 k-NN)")
     p.add_argument("--alpha_flow", type=float, default=0.3,
                    help="图像级融合权重: Flow 信号")
     p.add_argument("--alpha_knn", type=float, default=0.4,
@@ -199,15 +203,62 @@ def compute_patch_anomaly_score(
 
 
 @torch.no_grad()
+def compute_flow_patch_score(
+    patch_map: torch.Tensor,   # [V, N, D] Flow 编码后的 patch 特征
+) -> torch.Tensor:
+    """
+    用 Flow 编码特征计算 patch 级异常得分。
+    正常 patch 的编码特征应该接近全局均值（因为训练时 Flow 将所有正常特征映射到原点附近）。
+    异常 patch 偏离全局均值 → 得分高。
+
+    Returns:
+        patch_score: [V, N]
+    """
+    V, N, D = patch_map.shape
+    flat = patch_map.reshape(-1, D)  # [V*N, D]
+    center = flat.mean(dim=0, keepdim=True)  # [1, D]
+    dist = torch.norm(flat - center, dim=-1)  # [V*N]
+    return dist.reshape(V, N)
+
+
+def percentile_normalize(
+    scores: np.ndarray,
+    clip_low: float = 0.0,
+    clip_high: float = 100.0,
+) -> np.ndarray:
+    """
+    基于百分位的鲁棒归一化到 [0, 1]。
+    比 min-max 更稳定：不受极端离群值影响。
+
+    Args:
+        scores: 任意形状的 numpy 数组
+        clip_low:  下界百分位（低于此值的被截断为 0）
+        clip_high: 上界百分位（高于此值的被截断为 1）
+    """
+    lo = np.percentile(scores, clip_low)
+    hi = np.percentile(scores, clip_high)
+    rng = hi - lo if hi > lo else 1.0
+    normalized = np.clip((scores - lo) / rng, 0.0, 1.0)
+    return normalized
+
+
+@torch.no_grad()
 def generate_pixel_mask(
     patch_score: torch.Tensor,   # [V, N]  每个视角的 patch 异常得分
     n_h: int,                    # 水平 patch 数
     n_w: int,                    # 垂直 patch 数
     mask_size: int = MASK_SIZE,
-    smooth_sigma: float = 4.0,   # P1-H: 高斯平滑 σ (0=不平滑)
+    smooth_sigma: float = 2.0,   # 高斯平滑 σ (降低以保留更多边界细节)
+    clip_percentile: float = 30.0,  # 截断百分位：低于此百分位的得分置零
 ) -> np.ndarray:
     """
-    将 patch 级异常得分上采样为像素级 mask，并应用高斯平滑
+    将 patch 级异常得分上采样为像素级 mask，应用分数截断和高斯平滑。
+
+    改进点（相比逐视角 min-max 归一化）：
+    1. 跨视角全局归一化：保持视角间分数可比性
+    2. 分数截断：低于阈值的正常区域得分置零，大幅减少假阳性
+    3. 百分位归一化：比 min-max 更鲁棒，不受极端值影响
+    4. 降低平滑 σ：保留更清晰的缺陷边界
 
     Returns:
         masks: [V, mask_size, mask_size]  uint8 灰度图
@@ -225,7 +276,7 @@ def generate_pixel_mask(
         align_corners=False,
     )  # [V, 1, mask_size, mask_size]
 
-    # 3. P1-H: 高斯平滑，消除 patch 级棋盘格效应
+    # 3. 高斯平滑（降低 σ 以保留缺陷边界细节）
     if smooth_sigma > 0:
         kernel_size = max(5, int(smooth_sigma * 4) | 1)  # 确保奇数
         if kernel_size % 2 == 0:
@@ -239,18 +290,29 @@ def generate_pixel_mask(
         pad = kernel_size // 2
         upsampled = F.conv2d(upsampled, gauss_2d, padding=pad)
 
-    # 4. 逐视角归一化到 [0, 255]
+    # 4. 跨视角全局归一化 + 分数截断
     masks = upsampled.squeeze(1)  # [V, mask_size, mask_size]
+    scores_np = masks.cpu().float().numpy()  # [V, H, W]
+
+    # 跨所有视角计算全局百分位阈值
+    flat_scores = scores_np.flatten()
+    global_max = np.percentile(flat_scores, 99.5)  # 上界用 99.5 百分位（鲁棒）
+    global_min = flat_scores.min()
+    score_range = global_max - global_min if global_max > global_min else 1.0
+
     result = np.zeros((V, mask_size, mask_size), dtype=np.uint8)
 
     for v in range(V):
-        s = masks[v].cpu().float()
-        s_min, s_max = s.min(), s.max()
-        if s_max - s_min > 1e-8:
-            s = (s - s_min) / (s_max - s_min) * 255.0
-        else:
-            s = torch.zeros_like(s)
-        result[v] = s.numpy().astype(np.uint8)
+        s = scores_np[v].copy()
+
+        # 百分位截断：低于 clip_percentile 的得分置零
+        if clip_percentile > 0:
+            threshold = np.percentile(s, clip_percentile)
+            s = np.where(s > threshold, s - threshold, 0.0)
+
+        # 全局归一化到 [0, 255]
+        s = np.clip((s - global_min) / score_range, 0.0, 1.0)
+        result[v] = (s * 255).astype(np.uint8)
 
     return result
 
@@ -270,7 +332,9 @@ def run_inference(
     alpha_knn: float = 0.4,
     alpha_pixel: float = 0.3,
     use_multiscale: bool = True,   # P1-B: 是否使用多尺度特征
-    smooth_sigma: float = 4.0,     # P1-H: 异常图平滑 σ
+    smooth_sigma: float = 2.0,     # 异常图平滑 σ (降低以保留边界)
+    clip_percentile: float = 30.0, # 截断百分位：低于此值的得分置零
+    flow_patch_weight: float = 0.2,  # Flow patch 得分融合权重
 ) -> list:
     """
     在测试集上推理，生成 submission.csv 和 predicted_masks/
@@ -319,7 +383,7 @@ def run_inference(
             sid = sample_ids[i]
             group_folder = f"{cat}/{sid}"
 
-            # 像素级 k-NN 异常图
+            # 像素级 k-NN 异常图 + Flow patch 得分融合
             if cat in memory_bank:
                 if use_multiscale:
                     # P1-B: 多尺度拼接特征
@@ -329,9 +393,27 @@ def run_inference(
                     )  # [V, N, 2D]
                 else:
                     test_patches = patch_features[i]  # [V, N, D]
-                ps = compute_patch_anomaly_score(
+
+                # k-NN patch 得分
+                knn_patch = compute_patch_anomaly_score(
                     test_patches, memory_bank[cat], k=k_neighbors
                 )  # [V, N]
+
+                # Flow patch 得分：patch_map 编码特征与全局均值的距离
+                if flow_patch_weight > 0:
+                    patch_map_i = out["patch_map"][i]  # [V, N, d_model]
+                    flow_patch = compute_flow_patch_score(patch_map_i)  # [V, N]
+                    # 融合：k-NN 为主，Flow 为辅
+                    w_flow = flow_patch_weight
+                    w_knn = 1.0 - w_flow
+                    # 各自归一化后融合
+                    knn_norm = percentile_normalize(knn_patch.cpu().numpy())
+                    flow_norm = percentile_normalize(flow_patch.cpu().numpy())
+                    ps_np = w_knn * knn_norm + w_flow * flow_norm
+                    ps = torch.from_numpy(ps_np).to(knn_patch.device)
+                else:
+                    ps = knn_patch
+
                 # 图像级 k-NN 信号：每个视角 top-10% patch 的平均距离
                 V_s, N_s = ps.shape
                 k_top = max(1, N_s // 10)
@@ -364,7 +446,11 @@ def run_inference(
             # 生成并保存像素 mask
             sample_mask_dir = mask_dir / cat / sid
             sample_mask_dir.mkdir(parents=True, exist_ok=True)
-            masks = generate_pixel_mask(ps, n_h, n_w, smooth_sigma=smooth_sigma)
+            masks = generate_pixel_mask(
+                ps, n_h, n_w,
+                smooth_sigma=smooth_sigma,
+                clip_percentile=clip_percentile,
+            )
             for v in range(V):
                 mask_path = sample_mask_dir / f"{v}_mask.png"
                 Image.fromarray(masks[v], mode="L").save(str(mask_path))
@@ -498,6 +584,8 @@ def main():
         alpha_pixel=args.alpha_pixel,
         use_multiscale=not args.no_multiscale,
         smooth_sigma=args.smooth_sigma,
+        clip_percentile=args.clip_percentile,
+        flow_patch_weight=args.flow_patch_weight,
     )
 
     # ── 生成 CSV ──

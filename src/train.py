@@ -14,6 +14,10 @@ import os
 import sys
 import time
 
+# RTX 50 系列 (sm_120) cuBLAS LT 兼容性修复
+# 强制使用旧版 cuBLAS 后端，绕过 cublasLtMatmul 融合 GEMM 的崩溃问题
+os.environ.setdefault("CUBLAS_FRONTEND", "1")
+
 import torch
 import torch.nn as nn
 

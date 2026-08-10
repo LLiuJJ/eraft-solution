@@ -26,12 +26,14 @@ class INPFormerLoss(nn.Module):
         self,
         lambda_cls: float = 1.0,
         lambda_view: float = 0.5,
-        lambda_var: float = 0.1,
+        lambda_var: float = 1.0,      # 0.1→1.0: 大幅增强反塌缩力度
+        lambda_margin: float = 0.5,   # 新增: 强制 z 均值范数下界
     ):
         super().__init__()
         self.lambda_cls = lambda_cls
         self.lambda_view = lambda_view
         self.lambda_var = lambda_var
+        self.lambda_margin = lambda_margin
 
     def forward(self, outputs: dict) -> dict:
         """
@@ -53,10 +55,17 @@ class INPFormerLoss(nn.Module):
         # 方差偏离 1 的惩罚
         var_reg = ((var_cls - 1.0) ** 2).mean() + ((var_view - 1.0) ** 2).mean()
 
+        # 反塌缩 margin 项: 强制 batch 内 z 均值范数不低于 margin
+        # 如果 z 均值范数 < margin, 给予惩罚 (hinge loss)
+        cls_norm = z_cls.norm(dim=-1).mean()     # 标量
+        view_norm = z_view.norm(dim=-1).mean()   # 标量
+        margin_reg = torch.relu(1.0 - cls_norm).mean() + torch.relu(1.0 - view_norm).mean()
+
         total_loss = (
             self.lambda_cls * nll_cls
             + self.lambda_view * nll_view
             + self.lambda_var * var_reg
+            + self.lambda_margin * margin_reg
         )
 
         return {
@@ -64,5 +73,6 @@ class INPFormerLoss(nn.Module):
             "nll_cls": nll_cls.detach(),
             "nll_view": nll_view.detach(),
             "reg_loss": var_reg.detach(),
+            "margin_loss": margin_reg.detach(),
             "log_det_reg": torch.tensor(0.0),
         }

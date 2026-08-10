@@ -85,7 +85,7 @@ def train_one_epoch(
 ):
     """训练一个 epoch，支持 AMP 混合精度"""
     model.train()
-    tracker = MetricTracker(["total_loss", "nll_cls", "nll_view", "reg_loss", "log_det_reg"])
+    tracker = MetricTracker(["total_loss", "nll_cls", "nll_view", "reg_loss", "margin_loss", "log_det_reg"])
     use_amp = scaler is not None
 
     for batch_idx, batch in enumerate(dataloader):
@@ -145,6 +145,7 @@ def train_one_epoch(
                 f"nll_cls={avg['nll_cls']:.4f} "
                 f"nll_view={avg['nll_view']:.4f} "
                 f"reg={avg['reg_loss']:.4f} "
+                f"margin={avg.get('margin_loss', 0.0):.4f} "
                 f"log_det={avg['log_det_reg']:.4f}"
                 f"{'  [AMP]' if use_amp else ''}"
             )

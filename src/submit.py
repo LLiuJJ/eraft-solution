@@ -76,13 +76,13 @@ def parse_args():
                    help="异常图高斯平滑 σ (降低以保留边界细节)")
     p.add_argument("--clip_percentile", type=float, default=30.0,
                    help="得分截断百分位: 低于此值的像素得分置零 (0~100)")
-    p.add_argument("--flow_patch_weight", type=float, default=0.2,
-                   help="Flow patch 得分融合权重 (0=仅用 k-NN)")
-    p.add_argument("--alpha_flow", type=float, default=0.3,
-                   help="图像级融合权重: Flow 信号")
-    p.add_argument("--alpha_knn", type=float, default=0.4,
+    p.add_argument("--flow_patch_weight", type=float, default=0.0,
+                   help="Flow patch 得分融合权重 (0=仅用 k-NN, z 塌缩后默认关闭)")
+    p.add_argument("--alpha_flow", type=float, default=0.0,
+                   help="图像级融合权重: Flow 信号 (z 塌缩后默认关闭)")
+    p.add_argument("--alpha_knn", type=float, default=0.6,
                    help="图像级融合权重: k-NN 信号")
-    p.add_argument("--alpha_pixel", type=float, default=0.3,
+    p.add_argument("--alpha_pixel", type=float, default=0.4,
                    help="图像级融合权重: 像素级 max 信号")
     return p.parse_args()
 

@@ -97,6 +97,14 @@ uv run python -m src.train \
   --num_workers 8 \
   --dinov2_weights weights/dinov2_vitb14_pretrain.pth
 
+# 中断后恢复训练
+uv run python -m src.train \
+  --resume checkpoints/all/best.pth \
+  --epochs 100 \
+  --batch_size 8 \
+  --lr 1e-4 \
+  --dinov2_weights weights/dinov2_vitb14_pretrain.pth
+
 # 恢复训练
 uv run python -m src.train \
   --category battery \

@@ -329,19 +329,68 @@ $$
 S_{\text{flow}} = \|\mathbf{z}_{\text{cls}}\|_2 + \frac{1}{V}\sum_{j=1}^{V}\|\mathbf{z}_{\text{view},j}\|_2
 $$
 
-### 5.1.2 k-NN Memory Bank 距离
+### 5.1.2 k-NN Memory Bank 余弦距离
 
-对测试 patch $\mathbf{p}$ 和该类别的 Memory Bank $\mathcal{B} \in \mathbb{R}^{M \times D}$（L2 归一化），计算余弦相似度的 top-k 平均：
+#### Step 1: L2 归一化
 
-$$
-\text{sim}_k(\mathbf{p}) = \frac{1}{k}\sum_{i=1}^{k} \frac{\mathbf{p} \cdot \mathbf{b}_i}{\|\mathbf{p}\| \|\mathbf{b}_i\|}
-$$
+对测试 patch 特征和 Memory Bank 特征分别做 L2 归一化，使余弦相似度等价于内积：
 
 $$
-S_{\text{knn}} = \text{mean}\left(\text{top}_{10\%}\left(1 - \text{sim}_k(\mathbf{p}_n)\right)\right)
+\hat{\mathbf{p}} = \frac{\mathbf{p}}{\|\mathbf{p}\|_2}, \quad \hat{\mathbf{b}}_i = \frac{\mathbf{b}_i}{\|\mathbf{b}_i\|_2}
 $$
 
-图像级 k-NN 得分为每个视角 top-10% patch 异常得分的均值。
+其中 $\mathbf{p} \in \mathbb{R}^{D}$ 为单个测试 patch 的多尺度拼接特征（$D = 2 \times 768 = 1536$），$\mathbf{b}_i \in \mathcal{B}_c$ 为类别 $c$ 的 Memory Bank 中的第 $i$ 个参考特征。
+
+#### Step 2: 余弦相似度矩阵
+
+将 $VN$ 个测试 patch 与 Memory Bank 中 $M$ 个参考特征计算相似度，得到相似度矩阵：
+
+$$
+\mathbf{S} = \hat{\mathbf{P}} \cdot \hat{\mathcal{B}}_c^\top \in \mathbb{R}^{VN \times M}
+$$
+
+其中 $\hat{\mathbf{P}} \in \mathbb{R}^{VN \times D}$ 为展平后的归一化测试特征，$\hat{\mathcal{B}}_c \in \mathbb{R}^{M \times D}$ 为已归一化的 Memory Bank。
+
+矩阵元素 $S_{ij}$ 即为第 $i$ 个测试 patch 与第 $j$ 个参考特征的余弦相似度：
+
+$$
+S_{ij} = \cos\theta_{ij} = \frac{\mathbf{p}_i \cdot \mathbf{b}_j}{\|\mathbf{p}_i\| \|\mathbf{b}_j\|}
+$$
+
+> **归一化后内积等价于余弦相似度**：因为 $\|\hat{\mathbf{p}}\| = \|\hat{\mathbf{b}}\| = 1$，所以 $\hat{\mathbf{p}} \cdot \hat{\mathbf{b}} = \cos\theta$。
+
+#### Step 3: Top-k 最近邻选择
+
+对每个测试 patch，取相似度最高的 $k$ 个参考特征（$k = 3$）：
+
+$$
+\text{top}_k(S_{i,:}) = \text{sort}_{\downarrow}(S_{i,:})[:k] \in \mathbb{R}^{k}
+$$
+
+#### Step 4: 平均相似度与异常得分
+
+$$
+\bar{s}_i = \frac{1}{k} \sum_{j=1}^{k} S_{i,\sigma_j}
+$$
+
+其中 $\sigma_j$ 为第 $j$ 大相似度的索引。异常得分为：
+
+$$
+\boxed{d_i = 1 - \bar{s}_i = 1 - \frac{1}{k}\sum_{j=1}^{k}\cos\theta_{i,\sigma_j}}
+$$
+
+- 正常 patch：与 Memory Bank 中最近邻高度相似 $\bar{s} \approx 1$ → $d \approx 0$
+- 异常 patch：最近邻相似度低 $\bar{s} \ll 1$ → $d$ 接近 1
+
+#### Step 5: 图像级 k-NN 得分聚合
+
+对 $V$ 个视角的所有 $N$ 个 patch 得分，取 top-10% 的均值作为图像级得分：
+
+$$
+S_{\text{knn}} = \frac{1}{|\mathcal{T}|}\sum_{i \in \mathcal{T}} d_i, \quad |\mathcal{T}| = \max\left(1, \left\lfloor \frac{VN}{10} \right\rfloor\right)
+$$
+
+其中 $\mathcal{T}$ 为所有 $VN$ 个 patch 得分中值最大的 top-10% 索引集合。
 
 ### 5.1.3 像素级最大得分
 
@@ -365,17 +414,27 @@ $$
 
 ### 5.2.1 Patch 级异常得分
 
-k-NN 余弦距离 + 可选 Flow patch 融合：
+每个 patch $(v, n)$ 的异常得分由 k-NN 余弦距离（主路）和 Flow patch 距离（辅路）加权融合：
 
 $$
 \text{ps}_{v,n} = w_{\text{knn}} \cdot \tilde{d}_{\text{knn}}(v,n) + w_{\text{flow}} \cdot \tilde{d}_{\text{flow}}(v,n)
 $$
 
-Flow patch 得分为编码特征到全局均值的距离：
+当前默认（Flow 塌缩后）：$w_{\text{knn}} = 1.0, \; w_{\text{flow}} = 0.0$
+
+**k-NN patch 距离**（与 5.1.2 Step 4 一致）：
 
 $$
-d_{\text{flow}}(v,n) = \|\mathbf{P}_{v,n} - \bar{\mathbf{P}}\|_2, \quad \bar{\mathbf{P}} = \frac{1}{VN}\sum_{v,n}\mathbf{P}_{v,n}
+d_{\text{knn}}(v,n) = 1 - \frac{1}{k}\sum_{j=1}^{k}\cos\theta_{(v,n),\sigma_j}
 $$
+
+**Flow patch 距离**（编码特征到全局均值的 L2 距离）：
+
+$$
+d_{\text{flow}}(v,n) = \|\mathbf{P}_{v,n} - \bar{\mathbf{P}}\|_2, \quad \bar{\mathbf{P}} = \frac{1}{VN}\sum_{v=1}^{V}\sum_{n=1}^{N}\mathbf{P}_{v,n}
+$$
+
+其中 $\mathbf{P}_{v,n} \in \mathbb{R}^{d}$ 为 patch_head 输出的编码特征（$d = 256$），$\tilde{d}$ 表示百分位归一化后的值。
 
 ### 5.2.2 双线性上采样
 

@@ -72,10 +72,10 @@ def parse_args():
                    help="每个类别 memory bank 最大特征数")
     p.add_argument("--no_multiscale", action="store_true",
                    help="禁用多尺度特征融合（仅用最后一层）")
-    p.add_argument("--smooth_sigma", type=float, default=2.0,
-                   help="异常图高斯平滑 σ (降低以保留边界细节)")
-    p.add_argument("--clip_percentile", type=float, default=30.0,
-                   help="得分截断百分位: 低于此值的像素得分置零 (0~100)")
+    p.add_argument("--smooth_sigma", type=float, default=4.0,
+                   help="异常图高斯平滑 σ")
+    p.add_argument("--clip_percentile", type=float, default=0.0,
+                   help="得分截断百分位 (已禁用，截断破坏 AP 排序)")
     p.add_argument("--flow_patch_weight", type=float, default=0.0,
                    help="Flow patch 得分融合权重 (0=仅用 k-NN, z 塌缩后默认关闭)")
     p.add_argument("--alpha_flow", type=float, default=0.0,
@@ -91,20 +91,58 @@ def parse_args():
 
 def get_multiscale_patches(dinov2_feats: dict) -> torch.Tensor:
     """
-    P1-B: 拼接 DINOv2 最后两层的 patch 特征，融合浅层纹理 + 深层语义
+    拼接 DINOv2 全部 4 层多尺度 patch 特征，融合浅层纹理 + 中层结构 + 深层语义。
 
-    Args:
-        dinov2_feats: extract_multi_view() 的输出，包含 multi_scale_features
+    层选择：layers [8, 9, 10, 11]（ViT-B/12 共 12 层，取后 4 层）
+    更宽的特征维度（4×768=3072）提供更丰富的异常判据。
 
     Returns:
-        patches: [B, V, N, 2*D]  拼接后的多尺度特征
+        patches: [B, V, N, 4*D]  拼接后的多尺度特征
     """
     ms = dinov2_feats["multi_scale_features"]  # List[[B, V, N, D]]
-    # 取最后两层（语义层 + 深层）
-    layer_a = ms[-2]  # 倒数第二层
-    layer_b = ms[-1]  # 最后一层
-    fused = torch.cat([layer_a, layer_b], dim=-1)  # [B, V, N, 2D]
+    # 拼接全部 4 层
+    fused = torch.cat(ms, dim=-1)  # [B, V, N, 4D]
     return fused
+
+
+def local_neighborhood_aggregate(
+    patches: torch.Tensor,   # [B, V, N, D]  或 [V, N, D]
+    n_h: int,
+    n_w: int,
+    kernel_size: int = 3,
+) -> torch.Tensor:
+    """
+    局部邻域聚合（PatchCore 风格）：对每个 patch，将其特征与 3×3 邻域平均融合。
+
+    作用：
+    - 提供空间上下文，单个 patch 的异常会扩散到邻域
+    - 减少“椒盐”噪声式的假阳性
+    - 提升 F1max（边界更平滑）
+
+    Returns:
+        与输入同形状的特征 tensor
+    """
+    has_batch = patches.dim() == 4
+    if not has_batch:
+        patches = patches.unsqueeze(0)  # [1, V, N, D]
+
+    B, V, N, D = patches.shape
+    # reshape 为空间 grid: [B*V, D, H, W]
+    x = patches.reshape(B * V, n_h, n_w, D).permute(0, 3, 1, 2)  # [B*V, D, H, W]
+
+    pad = kernel_size // 2
+    x = F.pad(x, (pad, pad, pad, pad), mode="replicate")
+    # 均值卷积
+    weight = torch.ones(D, 1, kernel_size, kernel_size, device=x.device, dtype=x.dtype)
+    weight = weight / (kernel_size * kernel_size)
+    x = F.conv2d(x, weight, groups=D)  # depthwise conv = neighborhood average
+
+    # reshape 回 [B, V, N, D]
+    x = x.permute(0, 2, 3, 1).reshape(B, V, N, D)
+
+    if not has_batch:
+        x = x.squeeze(0)
+    return x
 
 
 # ── Phase 1: 构建 Memory Bank ─────────────────────────────────────
@@ -122,8 +160,8 @@ def build_memory_bank(
     Returns:
         dict: {category_name: Tensor[max_features, 2*dinov2_dim]}
     """
-    print("\n[Phase 1] 构建 Memory Bank (多尺度特征)...")
-    bank = {}  # {category: Tensor[≤max_features, 2D]}
+    print("\n[Phase 1] 构建 Memory Bank (4层多尺度 + 局部邻域聚合)...")
+    bank = {}  # {category: Tensor[≤max_features, 4D]}
 
     # 逐 batch 扫描，对每个类别增量收集并截断
     for batch_idx, batch in enumerate(tqdm(train_loader, desc="  扫描训练集")):
@@ -132,12 +170,15 @@ def build_memory_bank(
         B, V = views.shape[0], views.shape[1]
 
         dinov2_feats = dinov2.extract_multi_view(views)
-        # P1-B: 使用多尺度拼接特征
-        ms_patches = get_multiscale_patches(dinov2_feats)  # [B, V, N, 2D]
+        # 4 层多尺度拼接 + 局部邻域聚合
+        ms_patches = get_multiscale_patches(dinov2_feats)  # [B, V, N, 4D]
+        n_h = dinov2_feats["num_patches_h"]
+        n_w = dinov2_feats["num_patches_w"]
+        ms_patches = local_neighborhood_aggregate(ms_patches, n_h, n_w)  # [B, V, N, 4D]
 
         for i in range(B):
             cat = categories[i]
-            patches = ms_patches[i].reshape(-1, ms_patches.shape[-1])  # [V*N, 2D]
+            patches = ms_patches[i].reshape(-1, ms_patches.shape[-1])  # [V*N, 4D]
             sample_k = min(patches.shape[0], max_features // 5)
             if patches.shape[0] > sample_k:
                 idx = torch.randperm(patches.shape[0], device=device)[:sample_k]
@@ -248,71 +289,58 @@ def generate_pixel_mask(
     n_h: int,                    # 水平 patch 数
     n_w: int,                    # 垂直 patch 数
     mask_size: int = MASK_SIZE,
-    smooth_sigma: float = 2.0,   # 高斯平滑 σ (降低以保留更多边界细节)
-    clip_percentile: float = 30.0,  # 截断百分位：低于此百分位的得分置零
+    smooth_sigma: float = 4.0,   # 高斯平滑 σ
+    clip_percentile: float = 0.0, # 已禁用：截断破坏 AP 排序信息
 ) -> np.ndarray:
     """
-    将 patch 级异常得分上采样为像素级 mask，应用分数截断和高斯平滑。
+    将 patch 级异常得分上采样为像素级 mask。
 
-    改进点（相比逐视角 min-max 归一化）：
-    1. 跨视角全局归一化：保持视角间分数可比性
-    2. 分数截断：低于阈值的正常区域得分置零，大幅减少假阳性
-    3. 百分位归一化：比 min-max 更鲁棒，不受极端值影响
-    4. 降低平滑 σ：保留更清晰的缺陷边界
+    流程：reshape → 双线性上采样 → 高斯平滑 → 逐视角 min-max 归一化。
+
+    为什么用逐视角 min-max（而非全局/百分位）：
+    - AP 是排序指标，任何单调变换都不影响 AP；min-max 是单调的，不破坏排序
+    - 百分位截断将低分置零，破坏排序信息，降低 AP
+    - 逐视角归一化保持每个视角的动态范围，避免全局归一化压缩对比度
 
     Returns:
         masks: [V, mask_size, mask_size]  uint8 灰度图
     """
     V = patch_score.shape[0]
 
-    # 1. reshape 为 2D grid: [V, 1, n_h, n_w]
+    # 1. reshape 为 2D grid
     score_map = patch_score.reshape(V, 1, n_h, n_w)
 
-    # 2. 双线性上采样到 mask_size x mask_size
+    # 2. 双线性上采样
     upsampled = F.interpolate(
         score_map,
         size=(mask_size, mask_size),
         mode="bilinear",
         align_corners=False,
-    )  # [V, 1, mask_size, mask_size]
+    )
 
-    # 3. 高斯平滑（降低 σ 以保留缺陷边界细节）
+    # 3. 高斯平滑
     if smooth_sigma > 0:
-        kernel_size = max(5, int(smooth_sigma * 4) | 1)  # 确保奇数
+        kernel_size = max(5, int(smooth_sigma * 4) | 1)
         if kernel_size % 2 == 0:
             kernel_size += 1
         x = torch.arange(kernel_size, dtype=torch.float32) - kernel_size // 2
         gauss_1d = torch.exp(-0.5 * (x / smooth_sigma) ** 2)
         gauss_1d = gauss_1d / gauss_1d.sum()
-        gauss_2d = gauss_1d.unsqueeze(1) @ gauss_1d.unsqueeze(0)  # [K, K]
-        gauss_2d = gauss_2d.unsqueeze(0).unsqueeze(0)  # [1, 1, K, K]
-        gauss_2d = gauss_2d.to(upsampled.device)
+        gauss_2d = gauss_1d.unsqueeze(1) @ gauss_1d.unsqueeze(0)
+        gauss_2d = gauss_2d.unsqueeze(0).unsqueeze(0).to(upsampled.device)
         pad = kernel_size // 2
         upsampled = F.conv2d(upsampled, gauss_2d, padding=pad)
 
-    # 4. 跨视角全局归一化 + 分数截断
+    # 4. 逐视角 min-max 归一化到 [0, 255]
     masks = upsampled.squeeze(1)  # [V, mask_size, mask_size]
-    scores_np = masks.cpu().float().numpy()  # [V, H, W]
-
-    # 跨所有视角计算全局百分位阈值
-    flat_scores = scores_np.flatten()
-    global_max = np.percentile(flat_scores, 99.5)  # 上界用 99.5 百分位（鲁棒）
-    global_min = flat_scores.min()
-    score_range = global_max - global_min if global_max > global_min else 1.0
-
     result = np.zeros((V, mask_size, mask_size), dtype=np.uint8)
 
     for v in range(V):
-        s = scores_np[v].copy()
-
-        # 百分位截断：低于 clip_percentile 的得分置零
-        if clip_percentile > 0:
-            threshold = np.percentile(s, clip_percentile)
-            s = np.where(s > threshold, s - threshold, 0.0)
-
-        # 全局归一化到 [0, 255]
-        s = np.clip((s - global_min) / score_range, 0.0, 1.0)
-        result[v] = (s * 255).astype(np.uint8)
+        s = masks[v].cpu().float().numpy()
+        s_min, s_max = s.min(), s.max()
+        rng = s_max - s_min if s_max > s_min else 1.0
+        result[v] = np.clip((s - s_min) / rng, 0.0, 1.0).astype(np.float32)
+        result[v] = (result[v] * 255).astype(np.uint8)
 
     return result
 
@@ -383,14 +411,14 @@ def run_inference(
             sid = sample_ids[i]
             group_folder = f"{cat}/{sid}"
 
-            # 像素级 k-NN 异常图 + Flow patch 得分融合
+            # 像素级 k-NN 异常图
             if cat in memory_bank:
                 if use_multiscale:
-                    # P1-B: 多尺度拼接特征
-                    ms = dinov2_feats["multi_scale_features"]
-                    test_patches = torch.cat(
-                        [ms[-2][i], ms[-1][i]], dim=-1
-                    )  # [V, N, 2D]
+                    # 4 层多尺度拼接 + 局部邻域聚合
+                    test_patches = get_multiscale_patches(dinov2_feats)[i]  # [V, N, 4D]
+                    test_patches = local_neighborhood_aggregate(
+                        test_patches, n_h, n_w
+                    )  # [V, N, 4D]
                 else:
                     test_patches = patch_features[i]  # [V, N, D]
 

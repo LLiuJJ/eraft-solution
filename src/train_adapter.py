@@ -13,7 +13,7 @@ Feature Adapter 自监督训练脚本
 用法：
     uv run python -m src.train_adapter \
         --dinov2_weights weights/dinov2_vitb14_pretrain.pth \
-        --epochs 30 --batch_size 8 --image_size 518
+        --epochs 30 --batch_size 4 --image_size 518
 """
 import argparse
 import os
@@ -23,6 +23,8 @@ import time
 # RTX 50 系列 cuBLAS 兼容性
 os.environ.setdefault("CUBLAS_FRONTEND", "1")
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+# 内存优化：避免 fragmentation
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 import torch.nn.functional as F
@@ -48,7 +50,8 @@ def parse_args():
                    help="DINOv2 预训练权重路径")
     p.add_argument("--root_dir", type=str, default="data")
     p.add_argument("--image_size", type=int, default=518)
-    p.add_argument("--batch_size", type=int, default=8)
+    p.add_argument("--batch_size", type=int, default=4,
+                   help="训练 batch size（16GB 显存建议 4）")
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--lr", type=float, default=3e-4)
@@ -124,6 +127,25 @@ def build_adapter_memory_bank(
     return bank
 
 
+@torch.no_grad()
+def build_adapted_bank(
+    raw_bank: dict,
+    adapter: FeatureAdapter,
+) -> dict:
+    """
+    将原始 3072 维 bank 通过 adapter 转换为 1024 维并缓存。
+    每 epoch 开始调用一次，避免训练时重复计算。
+
+    Returns:
+        dict: {category: Tensor[M, 1024]}
+    """
+    adapted_bank = {}
+    for cat, features in raw_bank.items():
+        adapted = adapter(features)  # [M, 1024]
+        adapted_bank[cat] = F.normalize(adapted, dim=-1)
+    return adapted_bank
+
+
 # ── 单 epoch 训练 ──────────────────────────────────────────────────
 
 def train_one_epoch(
@@ -195,12 +217,9 @@ def train_one_epoch(
 
             for i in range(B):
                 cat = categories[i]
-                if cat not in memory_bank:
+                if cat not in adapted_bank:
                     continue
-                raw_bank = memory_bank[cat]  # [M, 3072] 原始特征
-
-                # 用 adapter 转换 bank 特征到 1024 维
-                bank_adapted = F.normalize(adapter(raw_bank), dim=-1)  # [M, 1024]
+                bank_adapted = adapted_bank[cat]  # [M, 1024] 预计算的
 
                 # 该样本的 patch 索引范围
                 start = i * V * N
@@ -306,7 +325,7 @@ def main():
     print(f"[Data] {len(train_loader.dataset)} 训练样本")
 
     # Memory Bank（正常特征参考）
-    memory_bank = build_adapter_memory_bank(dinov2, train_loader, device, max_per_cat=5000)
+    memory_bank = build_adapter_memory_bank(dinov2, train_loader, device, max_per_cat=2000)
 
     # Feature Adapter
     adapter = FeatureAdapter(
@@ -331,9 +350,12 @@ def main():
     print(f"{'='*60}\n")
 
     for epoch in range(args.epochs):
+        # 每 epoch 开始预计算 adapted bank（1024 维），避免重复计算
+        adapted_bank = build_adapted_bank(memory_bank, adapter)
+        
         t0 = time.time()
         avg_loss = train_one_epoch(
-            epoch, dinov2, adapter, train_loader, memory_bank,
+            epoch, dinov2, adapter, train_loader, memory_bank, adapted_bank,
             optimizer, device, margin=2.0, use_amp=use_amp,
         )
         scheduler.step()

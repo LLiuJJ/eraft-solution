@@ -197,7 +197,10 @@ def train_one_epoch(
                 cat = categories[i]
                 if cat not in memory_bank:
                     continue
-                bank = memory_bank[cat]  # [M, 3072] 已归一化
+                raw_bank = memory_bank[cat]  # [M, 3072] 原始特征
+
+                # 用 adapter 转换 bank 特征到 1024 维
+                bank_adapted = F.normalize(adapter(raw_bank), dim=-1)  # [M, 1024]
 
                 # 该样本的 patch 索引范围
                 start = i * V * N
@@ -210,7 +213,7 @@ def train_one_epoch(
 
                 # 正样本: 距最近邻的距离 → 最小化
                 dist_normal = torch.cdist(
-                    normal_adapted.unsqueeze(0), bank.unsqueeze(0)
+                    normal_adapted.unsqueeze(0), bank_adapted.unsqueeze(0)
                 ).squeeze(0)  # [V*N, M]
                 nn_dist_normal = dist_normal.min(dim=-1).values  # [V*N]
                 loss_pos = loss_pos + nn_dist_normal.sum()
@@ -221,7 +224,7 @@ def train_one_epoch(
                 if anomaly_mask.any():
                     anomaly_feats = anomaly_adapted[anomaly_mask]  # [k, 1024]
                     dist_anomaly = torch.cdist(
-                        anomaly_feats.unsqueeze(0), bank.unsqueeze(0)
+                        anomaly_feats.unsqueeze(0), bank_adapted.unsqueeze(0)
                     ).squeeze(0)  # [k, M]
                     nn_dist_anomaly = dist_anomaly.min(dim=-1).values  # [k]
                     # hinge: max(0, margin - dist)

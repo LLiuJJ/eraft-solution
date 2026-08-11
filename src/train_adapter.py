@@ -22,6 +22,7 @@ import time
 
 # RTX 50 系列 cuBLAS 兼容性
 os.environ.setdefault("CUBLAS_FRONTEND", "1")
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
 
 import torch
 import torch.nn.functional as F
@@ -56,6 +57,7 @@ def parse_args():
     p.add_argument("--checkpoint_dir", type=str, default="checkpoints/adapter")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--no_amp", action="store_true", help="禁用混合精度")
+    p.add_argument("--amp", action="store_true", help="启用混合精度（sm_120 默认关闭）")
     return p.parse_args()
 
 
@@ -78,6 +80,11 @@ def build_adapter_memory_bank(
     print("[Memory Bank] 扫描训练集构建正常特征库...")
     bank = {}
     n_h, n_w = None, None
+
+    # sm_120 兼容性: 清理 CUDA 状态
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
     for batch in train_loader:
         views = batch["views"].to(device)      # [B, V, C, H, W]
@@ -267,7 +274,12 @@ def main():
         device = torch.device("cpu")
     print(f"[Device] {device}")
 
-    use_amp = not args.no_amp and device.type == "cuda"
+    use_amp = args.amp and not args.no_amp and device.type == "cuda"
+    # RTX 5070 Ti (sm_120): AMP 可能触发未编译的 kernel，默认关闭
+    if use_amp:
+        print("[AMP] 混合精度已开启")
+    else:
+        print("[AMP] 混合精度已关闭 (sm_120 兼容性)")
 
     # 配置
     cfg = get_config()

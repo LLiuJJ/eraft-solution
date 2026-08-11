@@ -154,6 +154,7 @@ def train_one_epoch(
     adapter: FeatureAdapter,
     dataloader,
     memory_bank: dict,
+    adapted_bank: dict,
     optimizer,
     device: torch.device,
     margin: float = 2.0,

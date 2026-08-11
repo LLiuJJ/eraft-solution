@@ -8,10 +8,10 @@ uv run python -m src.train \
 
 # 提交
 uv run python -m src.submit \
-  --checkpoint checkpoints/all/best.pth \
+  --checkpoint checkpoints/all/last.pth \
   --test_split Test_A \
   --image_size 518 \
-  --batch_size 16 \
+  --batch_size 8 \
   --num_workers 8 \
   --dinov2_weights weights/dinov2_vitb14_pretrain.pth
 

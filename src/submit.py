@@ -100,8 +100,8 @@ def get_multiscale_patches(dinov2_feats: dict) -> torch.Tensor:
         patches: [B, V, N, 4*D]  拼接后的多尺度特征
     """
     ms = dinov2_feats["multi_scale_features"]  # List[[B, V, N, D]]
-    # 拼接全部 4 层
-    fused = torch.cat(ms, dim=-1)  # [B, V, N, 4D]
+    # 取最后两层（语义层 + 深层），避免高维余弦相似度维度灾难
+    fused = torch.cat([ms[-2], ms[-1]], dim=-1)  # [B, V, N, 2D]
     return fused
 
 
@@ -160,8 +160,8 @@ def build_memory_bank(
     Returns:
         dict: {category_name: Tensor[max_features, 2*dinov2_dim]}
     """
-    print("\n[Phase 1] 构建 Memory Bank (4层多尺度 + 局部邻域聚合)...")
-    bank = {}  # {category: Tensor[≤max_features, 4D]}
+    print("\n[Phase 1] 构建 Memory Bank (2层多尺度特征)...")
+    bank = {}  # {category: Tensor[≤max_features, 2D]}
 
     # 逐 batch 扫描，对每个类别增量收集并截断
     for batch_idx, batch in enumerate(tqdm(train_loader, desc="  扫描训练集")):
@@ -170,15 +170,12 @@ def build_memory_bank(
         B, V = views.shape[0], views.shape[1]
 
         dinov2_feats = dinov2.extract_multi_view(views)
-        # 4 层多尺度拼接 + 局部邻域聚合
-        ms_patches = get_multiscale_patches(dinov2_feats)  # [B, V, N, 4D]
-        n_h = dinov2_feats["num_patches_h"]
-        n_w = dinov2_feats["num_patches_w"]
-        ms_patches = local_neighborhood_aggregate(ms_patches, n_h, n_w)  # [B, V, N, 4D]
+        # 2 层多尺度拼接
+        ms_patches = get_multiscale_patches(dinov2_feats)  # [B, V, N, 2D]
 
         for i in range(B):
             cat = categories[i]
-            patches = ms_patches[i].reshape(-1, ms_patches.shape[-1])  # [V*N, 4D]
+            patches = ms_patches[i].reshape(-1, ms_patches.shape[-1])  # [V*N, 2D]
             sample_k = min(patches.shape[0], max_features // 5)
             if patches.shape[0] > sample_k:
                 idx = torch.randperm(patches.shape[0], device=device)[:sample_k]
@@ -414,11 +411,11 @@ def run_inference(
             # 像素级 k-NN 异常图
             if cat in memory_bank:
                 if use_multiscale:
-                    # 4 层多尺度拼接 + 局部邻域聚合
-                    test_patches = get_multiscale_patches(dinov2_feats)[i]  # [V, N, 4D]
-                    test_patches = local_neighborhood_aggregate(
-                        test_patches, n_h, n_w
-                    )  # [V, N, 4D]
+                    # 2 层多尺度拼接
+                    ms = dinov2_feats["multi_scale_features"]
+                    test_patches = torch.cat(
+                        [ms[-2][i], ms[-1][i]], dim=-1
+                    )  # [V, N, 2D]
                 else:
                     test_patches = patch_features[i]  # [V, N, D]
 

@@ -30,7 +30,7 @@ class DINOv2Config:
     embed_dim: int = 768
     frozen: bool = True                  # 冻结权重
     # 提取多层特征
-    out_indices: List[int] = field(default_factory=lambda: [3, 6, 9, 11])
+    out_indices: List[int] = field(default_factory=lambda: [4, 7, 10, 11])
     use_cls_token: bool = True
     # GPU 服务器适配
     weights_path: Optional[str] = None   # 本地权重路径（离线环境，留 None 则在线下载）

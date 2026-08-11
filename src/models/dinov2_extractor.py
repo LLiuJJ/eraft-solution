@@ -159,12 +159,13 @@ class DINOv2ViT(nn.Module):
         return torch.cat([extra, spatial], dim=1)
 
     def forward(
-        self, x: torch.Tensor, n_last: int = 4
+        self, x: torch.Tensor, layer_indices: Optional[List[int]] = None
     ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]]]:
         """
         Args:
-            x:      [B, C, H, W]
-            n_last: 返回最后 n 层的输出
+            x:              [B, C, H, W]
+            layer_indices:  要收集的 block 索引列表（0-indexed），如 [4,7,10,11]
+                            None 则取最后 4 层（保持向后兼容）
 
         Returns:
             cls_token: [B, D]
@@ -174,6 +175,15 @@ class DINOv2ViT(nn.Module):
         n_h = H // self.patch_size
         n_w = W // self.patch_size
         N = n_h * n_w
+        depth = len(self.blocks)
+
+        # 决定收集哪些层
+        if layer_indices is not None:
+            collect_set = set(layer_indices)
+            # 最后一层必须收集（norm 后的最终输出）
+            collect_set.add(depth - 1)
+        else:
+            collect_set = set(range(depth - 4, depth))  # 默认最后 4 层
 
         # Patch embedding
         x = self.patch_embed.proj(x)            # [B, D, H/P, W/P]
@@ -190,13 +200,11 @@ class DINOv2ViT(nn.Module):
         x = torch.cat([cls, x], dim=1)            # [B, 1+N, D]
 
         # Transformer blocks
-        depth = len(self.blocks)
-        start_collect = depth - n_last
         intermediates = []
 
         for i, block in enumerate(self.blocks):
             x = block(x)
-            if i >= start_collect:
+            if i in collect_set:
                 cls_out = x[:, 0]       # [B, D]
                 patch_out = x[:, 1:]    # [B, N, D]
                 intermediates.append((patch_out, cls_out))
@@ -314,9 +322,9 @@ class DINOv2Extractor(nn.Module):
 
     @torch.no_grad()
     def get_intermediate_layers(
-        self, x: torch.Tensor, n_last_blocks: int = 4
+        self, x: torch.Tensor, layer_indices: Optional[List[int]] = None
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
-        cls_token, intermediates = self.backbone(x, n_last=n_last_blocks)
+        cls_token, intermediates = self.backbone(x, layer_indices=layer_indices)
         patch_features = [patch for patch, _ in intermediates]
         cls_tokens = [cls for _, cls in intermediates]
         return cls_token, patch_features
@@ -328,18 +336,15 @@ class DINOv2Extractor(nn.Module):
         n_w = W // self.patch_size
 
         cls_token, patch_features_list = self.get_intermediate_layers(
-            x, n_last_blocks=len(self.out_indices)
+            x, layer_indices=self.out_indices
         )
 
-
         return {
-            "cls_token": cls_token, # 含义：ViT 第 12 层（最后一层）经过最终 LayerNorm 后的 CLS token，是对整张图像的全局语义摘要。
-            "patch_features": patch_features_list[-1], # 最后一层（block 11）的 patch 序列输出（经 LayerNorm）。1369 个 patch 各有一个 768 维向量，包含最深层语义信息。
-            "multi_scale_features": list(patch_features_list), # ViT 最后 4 层（block 8, 9, 10, 11）的 patch 输出，构成一个 4 元素列表。
-            # 每层捕捉不同抽象程度的特征（局部纹理、边缘、颜色；局部部件、形状模式；物体部件、语义概念； 
-            # 全局语义 （= patch_features））
-            "num_patches_h": n_h, # 图像高度被切成多少个 patch。计算方式：518 // 14 = 37（14 为 patch_size）。
-            "num_patches_w": n_w, # 同上，宽度方向。两者相乘 n_h × n_w = 37 × 37 = 1369 = N，即总 patch 数。 
+            "cls_token": cls_token,
+            "patch_features": patch_features_list[-1],  # 最后一层（block 11）patch 输出，经 LayerNorm
+            "multi_scale_features": list(patch_features_list),  # 按 out_indices 指定层拼接的多尺度特征
+            "num_patches_h": n_h,
+            "num_patches_w": n_w,
         }
 
     @torch.no_grad()

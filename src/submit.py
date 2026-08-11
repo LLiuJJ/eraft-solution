@@ -29,6 +29,7 @@ import os
 import sys
 import zipfile
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import torch
@@ -43,17 +44,23 @@ from src.config import get_config
 from src.data.dataset import build_dataloader
 from src.models.dinov2_extractor import DINOv2Extractor
 from src.models.inpformer import INPFormer
+from src.models.feature_adapter import FeatureAdapter
 
 
 # ── 常量 ─────────────────────────────────────────────────────────
 MASK_SIZE = 448  # 比赛要求的 mask 尺寸
-MEMORY_BANK_MAX = 5000  # P1-F: 增大 memory bank (2000→5000)
-K_NEIGHBORS = 5  # k-NN 近邻数
+MEMORY_BANK_MAX = 3000  # CoreSet 采样后每类最大特征数
+K_NEIGHBORS = 3  # k-NN 近邻数（PatchCore 默认）
+PCA_DIM = 1024  # PCA 降维目标维度
+CORESET_RATIO = 0.1  # CoreSet 保留比例（10%）
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="生成比赛提交包")
-    p.add_argument("--checkpoint", type=str, required=True)
+    p.add_argument("--checkpoint", type=str, default=None,
+                   help="INP-Former checkpoint (可选，不指定则纯 k-NN)")
+    p.add_argument("--adapter_checkpoint", type=str, default=None,
+                   help="Feature Adapter checkpoint 路径 (推荐)")
     p.add_argument("--root_dir", type=str, default="data")
     p.add_argument("--test_split", type=str, default="Test_A",
                    help="Test_A 或 Test_B")
@@ -87,21 +94,59 @@ def parse_args():
     return p.parse_args()
 
 
-# ── P1-B: 多尺度特征提取 ────────────────────────────────────────
+# ── PatchCore 风格特征处理 ─────────────────────────────────────
+
+class PatchCoreFeatures:
+    """
+    PatchCore 风格的特征处理：多尺度拼接 + PCA 降维 + 局部空间聚合。
+
+    与之前方案的区别：
+    - 4 层全部拼接（3072 维） → PCA 降到 1024 维（去除冗余，避免维度灾难）
+    - 局部 3×3 空间聚合后再存入 memory bank
+    - CoreSet 贪心采样替代随机采样
+    - L2 距离替代余弦距离（PatchCore 标准做法）
+    """
+
+    def __init__(self, pca_dim: int = PCA_DIM):
+        self.pca_dim = pca_dim
+        self.mean = None          # PCA 均值
+        self.components = None    # PCA 主成分 [D, pca_dim]
+
+    def fit_pca(self, features: torch.Tensor) -> None:
+        """
+        在 memory bank 特征上拟合 PCA（使用 SVD）。
+        features: [M, D]
+        """
+        M, D = features.shape
+        # 减去均值
+        self.mean = features.mean(dim=0)  # [D]
+        X = features - self.mean  # [M, D]
+        # SVD: X = U * S * V^T，取前 pca_dim 个主成分
+        U, S, V = torch.svd(X.T)  # V: [D, min(M,D)]
+        self.components = V[:, :self.pca_dim].contiguous()  # [D, pca_dim]
+        print(f"  PCA: {D} → {self.pca_dim} 维, 解释方差: {(S[:self.pca_dim]**2).sum() / (S**2).sum():.2%}")
+
+    def transform(self, features: torch.Tensor) -> torch.Tensor:
+        """PCA 降维: [*, D] → [*, pca_dim]"""
+        shape = features.shape
+        flat = features.reshape(-1, shape[-1])
+        projected = (flat - self.mean) @ self.components  # [*, pca_dim]
+        # L2 归一化
+        projected = F.normalize(projected, dim=-1)
+        return projected.reshape(*shape[:-1], self.pca_dim)
+
+    def fit_transform(self, features: torch.Tensor) -> torch.Tensor:
+        """拟合并变换"""
+        self.fit_pca(features)
+        return self.transform(features)
+
 
 def get_multiscale_patches(dinov2_feats: dict) -> torch.Tensor:
     """
-    拼接 DINOv2 全部 4 层多尺度 patch 特征，融合浅层纹理 + 中层结构 + 深层语义。
-
-    层选择：layers [8, 9, 10, 11]（ViT-B/12 共 12 层，取后 4 层）
-    更宽的特征维度（4×768=3072）提供更丰富的异常判据。
-
-    Returns:
-        patches: [B, V, N, 4*D]  拼接后的多尺度特征
+    拼接 DINOv2 全部 4 层 patch 特征（3072 维），后续用 PCA 降维。
     """
     ms = dinov2_feats["multi_scale_features"]  # List[[B, V, N, D]]
-    # 取最后两层（语义层 + 深层），避免高维余弦相似度维度灾难
-    fused = torch.cat([ms[-2], ms[-1]], dim=-1)  # [B, V, N, 2D]
+    fused = torch.cat(ms, dim=-1)  # [B, V, N, 4D=3072]
     return fused
 
 
@@ -112,40 +157,68 @@ def local_neighborhood_aggregate(
     kernel_size: int = 3,
 ) -> torch.Tensor:
     """
-    局部邻域聚合（PatchCore 风格）：对每个 patch，将其特征与 3×3 邻域平均融合。
-
-    作用：
-    - 提供空间上下文，单个 patch 的异常会扩散到邻域
-    - 减少“椒盐”噪声式的假阳性
-    - 提升 F1max（边界更平滑）
-
-    Returns:
-        与输入同形状的特征 tensor
+    局部 3×3 空间均值聚合：每个 patch 特征融合其空间邻域。
+    在 PCA 降维后执行（维度已降，depthwise conv 开销小）。
     """
     has_batch = patches.dim() == 4
     if not has_batch:
-        patches = patches.unsqueeze(0)  # [1, V, N, D]
+        patches = patches.unsqueeze(0)
 
     B, V, N, D = patches.shape
-    # reshape 为空间 grid: [B*V, D, H, W]
     x = patches.reshape(B * V, n_h, n_w, D).permute(0, 3, 1, 2)  # [B*V, D, H, W]
 
     pad = kernel_size // 2
     x = F.pad(x, (pad, pad, pad, pad), mode="replicate")
-    # 均值卷积
     weight = torch.ones(D, 1, kernel_size, kernel_size, device=x.device, dtype=x.dtype)
     weight = weight / (kernel_size * kernel_size)
-    x = F.conv2d(x, weight, groups=D)  # depthwise conv = neighborhood average
+    x = F.conv2d(x, weight, groups=D)
 
-    # reshape 回 [B, V, N, D]
     x = x.permute(0, 2, 3, 1).reshape(B, V, N, D)
-
     if not has_batch:
         x = x.squeeze(0)
     return x
 
 
-# ── Phase 1: 构建 Memory Bank ─────────────────────────────────────
+def coreset_sample(features: torch.Tensor, num_select: int) -> torch.Tensor:
+    """
+    CoreSet 贪心采样（PatchCore 的 greedy coreset）。
+
+    贪心 farthest point sampling：每步选离已选集合最远的点。
+    比随机采样更好地覆盖特征空间多样性。
+
+    Args:
+        features: [M, D] 候选特征
+        num_select: 选取数量
+
+    Returns:
+        selected: [num_select, D]
+    """
+    M, D = features.shape
+    num_select = min(num_select, M)
+
+    if num_select >= M:
+        return features
+
+    # 初始化：选第一个点（距均值最远）
+    center = features.mean(dim=0, keepdim=True)  # [1, D]
+    dists = torch.cdist(features.unsqueeze(0), center.unsqueeze(0)).squeeze()  # [M]
+    selected_idx = [dists.argmax().item()]
+
+    # 贪心选择
+    min_dists = torch.full((M,), float('inf'), device=features.device)
+    for _ in range(num_select - 1):
+        # 更新每个点到最近已选点的距离
+        last = features[selected_idx[-1]]  # [D]
+        d = torch.norm(features - last, dim=-1)  # [M]
+        min_dists = torch.min(min_dists, d)
+        # 选距离最大的点
+        next_idx = min_dists.argmax().item()
+        selected_idx.append(next_idx)
+
+    return features[selected_idx]
+
+
+# ── Phase 1: 构建 Memory Bank (PatchCore 风格) ─────────────────
 
 @torch.no_grad()
 def build_memory_bank(
@@ -153,91 +226,166 @@ def build_memory_bank(
     train_loader,
     device: torch.device,
     max_features: int = MEMORY_BANK_MAX,
+    coreset_ratio: float = CORESET_RATIO,
+    adapter: Optional[FeatureAdapter] = None,
 ) -> dict:
     """
-    扫描训练集，为每个类别构建多尺度 DINOv2 patch 特征的 memory bank
+    PatchCore 风格 Memory Bank 构建流程：
+    1. 收集训练集所有 patch 特征（4层拼接 3072 维）
+    2. 降维：adapter (推荐) 或 PCA (3072 → 1024 维)
+    3. 局部 3×3 空间聚合
+    4. CoreSet 贪心采样
 
     Returns:
-        dict: {category_name: Tensor[max_features, 2*dinov2_dim]}
+        dict: {category_name: {"features": Tensor, "adapter"/"pca": ..., "n_h": int, "n_w": int}}
     """
-    print("\n[Phase 1] 构建 Memory Bank (2层多尺度特征)...")
-    bank = {}  # {category: Tensor[≤max_features, 2D]}
+    mode = "adapter" if adapter is not None else "PCA"
+    print(f"\n[Phase 1] 构建 Memory Bank (PatchCore: 4层+{mode}{PCA_DIM}+3×3聚合+CoreSet{coreset_ratio:.0%})")
 
-    # 逐 batch 扫描，对每个类别增量收集并截断
-    for batch_idx, batch in enumerate(tqdm(train_loader, desc="  扫描训练集")):
+    # Step 1: 收集所有原始多尺度特征
+    raw_bank = {}  # {category: Tensor[≤collect_max, 4D]}
+    collect_max = 20000  # 每类最多收集 20000 个候选
+    n_h, n_w = None, None
+
+    for batch_idx, batch in enumerate(tqdm(train_loader, desc="  [1/4] 收集特征")):
         views = batch["views"].to(device)
         categories = batch["category"]
         B, V = views.shape[0], views.shape[1]
 
         dinov2_feats = dinov2.extract_multi_view(views)
-        # 2 层多尺度拼接
-        ms_patches = get_multiscale_patches(dinov2_feats)  # [B, V, N, 2D]
+        if n_h is None:
+            n_h = dinov2_feats["num_patches_h"]
+            n_w = dinov2_feats["num_patches_w"]
+
+        ms_patches = get_multiscale_patches(dinov2_feats)  # [B, V, N, 4D]
 
         for i in range(B):
             cat = categories[i]
-            patches = ms_patches[i].reshape(-1, ms_patches.shape[-1])  # [V*N, 2D]
-            sample_k = min(patches.shape[0], max_features // 5)
-            if patches.shape[0] > sample_k:
-                idx = torch.randperm(patches.shape[0], device=device)[:sample_k]
-                patches = patches[idx]
-            patches_cpu = patches.cpu()
-
-            if cat not in bank:
-                bank[cat] = patches_cpu
+            patches = ms_patches[i].reshape(-1, ms_patches.shape[-1]).cpu()  # [V*N, 4D]
+            if cat not in raw_bank:
+                raw_bank[cat] = patches
             else:
-                bank[cat] = torch.cat([bank[cat], patches_cpu], dim=0)
-                if bank[cat].shape[0] > max_features:
-                    idx = torch.randperm(bank[cat].shape[0])[:max_features]
-                    bank[cat] = bank[cat][idx]
+                raw_bank[cat] = torch.cat([raw_bank[cat], patches], dim=0)
+                if raw_bank[cat].shape[0] > collect_max:
+                    idx = torch.randperm(raw_bank[cat].shape[0])[:collect_max]
+                    raw_bank[cat] = raw_bank[cat][idx]
 
         del dinov2_feats, ms_patches
 
-    # L2 归一化并移到 GPU
-    for cat in bank:
-        bank[cat] = F.normalize(bank[cat], dim=-1).to(device)
-        print(f"  {cat}: {bank[cat].shape[0]} 个特征, dim={bank[cat].shape[1]}")
+    # Step 2-4: 按类别处理（降维 → 空间聚合 → CoreSet）
+    final_bank = {}  # {category: {"features": Tensor, "adapter"/"pca": ..., "n_h", "n_w"}}
 
-    print(f"[Phase 1] 完成，共 {len(bank)} 个类别\n")
-    return bank
+    for cat, features in raw_bank.items():
+        print(f"\n  [{cat}] 候选: {features.shape[0]} × {features.shape[1]}")
+
+        # Step 2: 降维 (adapter 或 PCA)
+        if adapter is not None:
+            # 用训练好的 adapter 降维
+            reduced = adapter(features.to(device))  # [M, 1024]
+            reduced = F.normalize(reduced, dim=-1)
+            entry_key = "adapter"
+            entry_val = adapter
+        else:
+            # 拟合 PCA 降维
+            pca = PatchCoreFeatures(pca_dim=PCA_DIM)
+            reduced = pca.fit_transform(features.to(device))  # [M, PCA_DIM]
+            entry_key = "pca"
+            entry_val = pca
+
+        # Step 3: 局部空间聚合
+        # reshape 为 [1, 1, N, PCA_DIM] 以应用空间聚合
+        N = n_h * n_w
+        num_views = features.shape[0] // N  # 训练样本数（近似）
+        if num_views > 0:
+            # 按样本分批做空间聚合
+            batch_size = 100  # 避免 OOM
+            aggregated = []
+            for start in range(0, reduced.shape[0], batch_size):
+                end = min(start + batch_size, reduced.shape[0])
+                chunk = reduced[start:end]  # [k, PCA_DIM]
+                # reshape: [k, N, PCA_DIM] → 但 k 可能不是 N 的整数倍
+                # 简化：对每个样本的 patch 做空间聚合
+                n_samples = chunk.shape[0] // N
+                if n_samples == 0:
+                    aggregated.append(chunk)  # 不够一个样本，直接保留
+                    continue
+                usable = chunk[:n_samples * N]  # [n_samples * N, PCA_DIM]
+                usable = usable.reshape(n_samples, 1, N, PCA_DIM)  # [n, 1, N, D]
+                usable = local_neighborhood_aggregate(usable, n_h, n_w, kernel_size=3)
+                usable = F.normalize(usable.reshape(-1, PCA_DIM), dim=-1)  # 重新归一化
+                aggregated.append(usable)
+                # 处理剩余不足一个样本的部分
+                remainder = chunk[n_samples * N:]
+                if remainder.shape[0] > 0:
+                    aggregated.append(remainder)
+            reduced = torch.cat(aggregated, dim=0)
+
+        # Step 4: CoreSet 采样
+        num_select = max(100, int(reduced.shape[0] * coreset_ratio))
+        num_select = min(num_select, max_features, reduced.shape[0])
+        coreset = coreset_sample(reduced, num_select)  # [num_select, PCA_DIM]
+
+        final_bank[cat] = {
+            "features": coreset.to(device),
+            entry_key: entry_val,
+            "n_h": n_h,
+            "n_w": n_w,
+        }
+        print(f"  [{cat}] CoreSet: {coreset.shape[0]} 个特征 ({mode})")
+
+    print(f"\n[Phase 1] 完成，共 {len(final_bank)} 个类别\n")
+    return final_bank
 
 
 # ── 像素级异常热力图生成 ────────────────────────────────────────
 
 @torch.no_grad()
 def compute_patch_anomaly_score(
-    test_patches: torch.Tensor,   # [V, N, D] 测试样本的 DINOv2 patch 特征
-    memory_bank: torch.Tensor,    # [M, D] 该类别的 memory bank（已 L2 归一化）
+    test_patches: torch.Tensor,       # [V, N, D] 测试样本 patch 特征（原始多尺度）
+    bank_entry: dict,                 # {"features": Tensor, "adapter"/"pca": ..., "n_h", "n_w"}
     k: int = K_NEIGHBORS,
 ) -> torch.Tensor:
     """
-    计算每个 patch 的 k-NN 异常得分
-
-    Args:
-        test_patches: [V, N, D]
-        memory_bank:  [M, D] 已 L2 归一化
+    PatchCore 风格 k-NN 异常得分计算：
+    1. 用 adapter (推荐) 或 PCA 降维测试特征
+    2. 局部 3×3 空间聚合
+    3. L2 距离计算 k-NN
 
     Returns:
         patch_score: [V, N] 每个 patch 的异常得分
     """
-    V, N, D = test_patches.shape
-    M = memory_bank.shape[0]
+    V, N, D_raw = test_patches.shape
+    bank_feats = bank_entry["features"]  # [M, out_dim]
+    n_h = bank_entry["n_h"]
+    n_w = bank_entry["n_w"]
+    M = bank_feats.shape[0]
+    out_dim = bank_feats.shape[1]
 
-    # L2 归一化测试特征
-    test_norm = F.normalize(test_patches.reshape(-1, D), dim=-1)  # [V*N, D]
+    # Step 1: 降维测试特征 (adapter 或 PCA)
+    if "adapter" in bank_entry:
+        adapter = bank_entry["adapter"]
+        test_reduced = adapter(test_patches.reshape(-1, D_raw))  # [V*N, 1024]
+        test_reduced = F.normalize(test_reduced, dim=-1)
+    else:
+        pca = bank_entry["pca"]
+        test_reduced = pca.transform(test_patches.reshape(-1, D_raw))  # [V*N, PCA_DIM]
 
-    # 计算余弦相似度矩阵: [V*N, M]
-    # 由于都已 L2 归一化，点积 = 余弦相似度
-    sim_matrix = test_norm @ memory_bank.T  # [V*N, M]
+    test_reduced = test_reduced.reshape(V, N, -1)  # [V, N, out_dim]
 
-    # 取 top-k 最近邻的平均相似度
+    # Step 2: 局部 3×3 空间聚合
+    test_reduced = local_neighborhood_aggregate(test_reduced, n_h, n_w, kernel_size=3)  # [V, N, out_dim]
+    test_reduced = F.normalize(test_reduced.reshape(-1, out_dim), dim=-1)  # 重新归一化
+
+    # Step 3: L2 距离 k-NN（PatchCore 标准）
+    # cdist: [V*N, M] L2 距离
+    dists = torch.cdist(test_reduced.unsqueeze(0), bank_feats.unsqueeze(0)).squeeze(0)  # [V*N, M]
+
     k = min(k, M)
-    topk_sim, _ = sim_matrix.topk(k, dim=-1)  # [V*N, k]
-    avg_sim = topk_sim.mean(dim=-1)  # [V*N]
+    topk_dist, _ = dists.topk(k, dim=-1, largest=False)  # [V*N, k] 最近 k 个距离
+    # 异常得分 = k 个最近邻的平均距离
+    avg_dist = topk_dist.mean(dim=-1)  # [V*N]
 
-    # 异常得分 = 1 - 平均相似度（越小越正常，越大越异常）
-    patch_score = 1.0 - avg_sim  # [V*N]
-
-    return patch_score.reshape(V, N)
+    return avg_dist.reshape(V, N)
 
 
 @torch.no_grad()
@@ -336,8 +484,8 @@ def generate_pixel_mask(
         s = masks[v].cpu().float().numpy()
         s_min, s_max = s.min(), s.max()
         rng = s_max - s_min if s_max > s_min else 1.0
-        result[v] = np.clip((s - s_min) / rng, 0.0, 1.0).astype(np.float32)
-        result[v] = (result[v] * 255).astype(np.uint8)
+        normalized = np.clip((s - s_min) / rng, 0.0, 1.0)  # float [0,1]
+        result[v] = (normalized * 255).astype(np.uint8)   # uint8 [0,255]
 
     return result
 
@@ -347,19 +495,19 @@ def generate_pixel_mask(
 @torch.no_grad()
 def run_inference(
     dinov2: DINOv2Extractor,
-    model: INPFormer,
+    model: Optional[INPFormer],  # None 时纯 k-NN，跳过 INP-Former
     dataloader,
     memory_bank: dict,
     device: torch.device,
     output_dir: str,
     k_neighbors: int = K_NEIGHBORS,
-    alpha_flow: float = 0.3,
-    alpha_knn: float = 0.4,
-    alpha_pixel: float = 0.3,
-    use_multiscale: bool = True,   # P1-B: 是否使用多尺度特征
-    smooth_sigma: float = 2.0,     # 异常图平滑 σ (降低以保留边界)
-    clip_percentile: float = 30.0, # 截断百分位：低于此值的得分置零
-    flow_patch_weight: float = 0.2,  # Flow patch 得分融合权重
+    alpha_flow: float = 0.0,
+    alpha_knn: float = 0.6,
+    alpha_pixel: float = 0.4,
+    use_multiscale: bool = True,
+    smooth_sigma: float = 4.0,
+    clip_percentile: float = 0.0,
+    flow_patch_weight: float = 0.0,
 ) -> list:
     """
     在测试集上推理，生成 submission.csv 和 predicted_masks/
@@ -367,7 +515,8 @@ def run_inference(
     Returns:
         List[dict]: 所有样本的结果
     """
-    model.eval()
+    if model is not None:
+        model.eval()
 
     # 创建 mask 输出目录
     mask_dir = Path(output_dir) / "predicted_masks"
@@ -392,15 +541,17 @@ def run_inference(
         n_h = dinov2_feats["num_patches_h"]
         n_w = dinov2_feats["num_patches_w"]
 
-        # ── 2. INP-Former 推理（Flow 图像级得分）──
-        out = model(dinov2_feats)
-
-        # ── 3. Flow 图像级得分（z 空间 L2 距离）──
-        z_cls = out["z_cls"]          # [B, d_model]
-        z_view = out["z_view"]        # [B, V, d_model]
-        cls_dist = torch.norm(z_cls, dim=-1)
-        view_dist = torch.norm(z_view, dim=-1).mean(dim=-1)
-        flow_score = cls_dist + view_dist  # [B]
+        # ── 2. INP-Former 推理（Flow 图像级得分，可选）──
+        if model is not None:
+            out = model(dinov2_feats)
+            z_cls = out["z_cls"]
+            z_view = out["z_view"]
+            cls_dist = torch.norm(z_cls, dim=-1)
+            view_dist = torch.norm(z_view, dim=-1).mean(dim=-1)
+            flow_score = cls_dist + view_dist  # [B]
+        else:
+            # 纯 k-NN 模式，无 Flow 信号
+            flow_score = torch.zeros(B, device=device)
 
         # ── 4. 像素级异常得分 + Memory Bank k-NN 图像级得分 ──
         for i in range(B):
@@ -410,16 +561,11 @@ def run_inference(
 
             # 像素级 k-NN 异常图
             if cat in memory_bank:
-                if use_multiscale:
-                    # 2 层多尺度拼接
-                    ms = dinov2_feats["multi_scale_features"]
-                    test_patches = torch.cat(
-                        [ms[-2][i], ms[-1][i]], dim=-1
-                    )  # [V, N, 2D]
-                else:
-                    test_patches = patch_features[i]  # [V, N, D]
+                # 始终用 4 层多尺度拼接（与 memory bank 训练时的维度一致）
+                ms = dinov2_feats["multi_scale_features"]
+                test_patches = torch.cat(ms, dim=-1)[i]  # [V, N, 4D=3072]
 
-                # k-NN patch 得分
+                # k-NN patch 得分（PatchCore 风格：PCA + 空间聚合 + L2 距离）
                 knn_patch = compute_patch_anomaly_score(
                     test_patches, memory_bank[cat], k=k_neighbors
                 )  # [V, N]
@@ -449,13 +595,11 @@ def run_inference(
                 if cat not in missing_cats:
                     print(f"  [警告] 类别 '{cat}' 无 memory bank，使用回退方案")
                     missing_cats.add(cat)
-                encoded = out["patch_map"]  # [B, V, N, d_model]
-                cls_feat = out["z_cls"][i]  # [d_model]
-                patch_feats = encoded[i]    # [V, N, d_model]
-                cos_sim = F.cosine_similarity(
-                    patch_feats, cls_feat.unsqueeze(0).unsqueeze(0).expand_as(patch_feats), dim=-1
-                )
-                ps = 1.0 - cos_sim  # [V, N]
+                # 回退方案: 用 DINOv2 patch 特征的方差作为异常图
+                ms = dinov2_feats["multi_scale_features"]
+                test_patches_raw = torch.cat(ms, dim=-1)[i]  # [V, N, 4D]
+                # 正常 patch 特征方差小，异常 patch 方差大
+                ps = test_patches_raw.var(dim=-1)  # [V, N]
                 knn_score = 0.0
                 pixel_max = ps.max().item()
 
@@ -541,10 +685,21 @@ def create_submission_zip(submission_dir: str, zip_path: str):
 def main():
     args = parse_args()
 
+    # 至少需要一个 checkpoint
+    if not args.checkpoint and not args.adapter_checkpoint:
+        print("[错误] 必须指定 --checkpoint 或 --adapter_checkpoint 至少一个")
+        sys.exit(1)
+
     # ── 配置 ──
-    print(f"加载 checkpoint: {args.checkpoint}")
-    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    cfg = ckpt.get("config", get_config())
+    # 加载 INP-Former checkpoint (可选)
+    if args.checkpoint:
+        print(f"加载 INP-Former checkpoint: {args.checkpoint}")
+        ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+        cfg = ckpt.get("config", get_config())
+    else:
+        print("无 INP-Former checkpoint，纯 k-NN 模式")
+        cfg = get_config()
+        ckpt = None
 
     if args.device:
         cfg.train.device = args.device
@@ -559,7 +714,7 @@ def main():
 
     device = torch.device(cfg.train.device)
 
-    # ── 模型 ──
+    # ── DINOv2 ──
     dinov2 = DINOv2Extractor(
         model_name=cfg.dinov2.model_name,
         out_indices=cfg.dinov2.out_indices,
@@ -568,27 +723,47 @@ def main():
         weights_path=cfg.dinov2.weights_path,
     ).to(device)
 
-    model = INPFormer(
-        dinov2_dim=cfg.dinov2.embed_dim,
-        d_model=cfg.inpformer.d_model,
-        n_heads=cfg.inpformer.n_heads,
-        n_layers=cfg.inpformer.n_layers,
-        dim_ff=cfg.inpformer.dim_ff,
-        dropout=0.0,
-        num_views=cfg.data.num_views,
-        n_flow_layers=cfg.inpformer.n_flow_layers,
-        coupling_hidden=cfg.inpformer.coupling_hidden,
-        score_type=cfg.inpformer.score_type,
-    ).to(device)
+    # ── INP-Former (可选) ──
+    model = None
+    if ckpt is not None:
+        model = INPFormer(
+            dinov2_dim=cfg.dinov2.embed_dim,
+            d_model=cfg.inpformer.d_model,
+            n_heads=cfg.inpformer.n_heads,
+            n_layers=cfg.inpformer.n_layers,
+            dim_ff=cfg.inpformer.dim_ff,
+            dropout=0.0,
+            num_views=cfg.data.num_views,
+            n_flow_layers=cfg.inpformer.n_flow_layers,
+            coupling_hidden=cfg.inpformer.coupling_hidden,
+            score_type=cfg.inpformer.score_type,
+        ).to(device)
+        model.load_state_dict(ckpt["model"])
+        print(f"已加载 INP-Former, epoch={ckpt.get('epoch', 'N/A')}")
 
-    model.load_state_dict(ckpt["model"])
-    print(f"已加载模型, epoch={ckpt.get('epoch', 'N/A')}")
+    # ── Feature Adapter (推荐) ──
+    adapter = None
+    if args.adapter_checkpoint:
+        print(f"加载 Feature Adapter: {args.adapter_checkpoint}")
+        adapter_ckpt = torch.load(args.adapter_checkpoint, map_location=device, weights_only=False)
+        adapter_cfg = adapter_ckpt.get("config", {})
+        adapter = FeatureAdapter(
+            input_dim=adapter_cfg.get("input_dim", 4 * cfg.dinov2.embed_dim),
+            output_dim=adapter_cfg.get("output_dim", 1024),
+            hidden_dim=adapter_cfg.get("hidden_dim", 2048),
+            dropout=adapter_cfg.get("dropout", 0.1),
+        ).to(device)
+        adapter.load_state_dict(adapter_ckpt["adapter_state"])
+        adapter.eval()
+        print(f"已加载 Feature Adapter (loss={adapter_ckpt.get('loss', 'N/A'):.4f})")
 
     # ── Phase 1: 构建 Memory Bank ──
     train_categories = [args.category] if args.category else None
     train_loader = build_dataloader(cfg, split="Train", categories=train_categories)
     memory_bank = build_memory_bank(
-        dinov2, train_loader, device, max_features=args.memory_bank_max
+        dinov2, train_loader, device,
+        max_features=args.memory_bank_max,
+        adapter=adapter,
     )
 
     # ── Phase 2: 推理 ──
